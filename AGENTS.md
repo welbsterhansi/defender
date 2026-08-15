@@ -44,7 +44,7 @@ Primary consumers: platform SRE team (report), developers (remediation actions),
 | File                  | Language | Role |
 |-----------------------|----------|------|
 | `defender.sh`         | Bash     | Queries Azure Resource Graph (KQL) for CVEs on ACR images. Supports block/unblock/list/scan modes. |
-| `check_ocp.sh`        | Bash     | For each OpenShift project, list running pods and cross-reference their image digests with the CVE CSV. Emits a flat (workload × image × CVE) CSV. |
+| `check_ocp.sh`        | Bash     | For each OpenShift project, list running pods and cross-reference their image digests with the CVE CSV. Emits a flat (workload × image × CVE) CSV. Classifies each namespace into one of five states (`SUCCESS_WITH_PODS`, `NO_PODS`, `RBAC_ERR`, `OC_ERR`, `PARSE_ERR`) and prints a coverage summary; exit `0` = complete, exit `3` = partial coverage. |
 | `group_findings.py`   | Python   | Called by `check_ocp.sh` to aggregate the flat CSV into one row per unique `(namespace, workload, image)` — CVE list, severity map, max CVSS, carried package/exploit fields. Was previously inline `python3 -c '...'`. |
 | `expandcsv.py`        | Python   | Explodes the grouped CSV into one row per unique `(namespace, workload, repository, digest, cveId)`. Uses a 3-level lookup (full → repo+cve → digest-prefix) to tolerate multi-arch manifests. |
 | `report.py`           | Python   | Generates a self-contained HTML report with cluster health score, top CVEs, per-namespace breakdown, and executive analysis. |
@@ -152,3 +152,5 @@ HAS_VERIFIED_EXPLOIT, LAST_PUSHED_TO_REGISTRY_UTC
 - Never run `defender.sh --block-images` or `--unblock*` against production ACR without human approval.
 - Never run `oc apply/delete` from any script in this repo — read-only OCP access is sufficient.
 - `check_ocp.sh` filters out `openshift-*`, `kube-*`, `default`, `logging`, `monitoring` namespaces to avoid noise from platform-managed workloads.
+- **Trust the report only when `check_ocp.sh` prints `COVERAGE: COMPLETE`.** Exit code `3` means at least one namespace failed (typically RBAC) and the report is missing workloads. Distributing a partial report as authoritative is the failure mode this classification exists to prevent.
+- `make smoke-real ACR_NAME=<acr>` is the only Make target that touches real infrastructure; it runs in the tightest safe band (CVSS 9.8–10, report-only). No target ever runs block/unblock.

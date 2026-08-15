@@ -14,7 +14,7 @@ Local pipeline that scans an **Azure Container Registry (ACR)** for image vulner
 | `bc` | any | CVSS score arithmetic in `defender.sh` |
 | Python | ≥ 3.11 | `expandcsv.py` and `report.py` |
 
-Install on macOS: `brew install azure-cli openshift-cli jq bc python@3.11`
+Target runtime is Linux / WSL (bash 4+). macOS works for local dev if you install a newer bash (`brew install bash`).
 
 ## Quickstart — full pipeline
 
@@ -84,6 +84,53 @@ Then continue the pipeline (still no side effects on ACR/OCP — read-only):
 python3 expandcsv.py
 python3 report.py
 ```
+
+### Reading `check_ocp.sh` coverage output
+
+Each run prints a `=== Coverage summary ===` block. **Trust the report only when it says `COVERAGE: COMPLETE`.**
+
+```
+=== Coverage summary ===
+  Namespaces visible:        42
+  Ignored (platform filter): 8
+  Analyzed (OK, with pods):  30
+  Analyzed (OK, no pods):    3
+  RBAC errors:               1     ← namespace we could not query
+  Other oc errors:           0
+  Parse errors:              0
+  Pods processed:            487
+  Digest matches:            15
+  COVERAGE: PARTIAL — 1 namespace(s) failed
+    RBAC-blocked: prd-restricted
+```
+
+| Bucket | Meaning | What to do |
+|--------|---------|------------|
+| `Analyzed (OK, ...)` | oc + jq succeeded | nothing |
+| `Ignored (platform filter)` | namespace excluded by design (`openshift-*`, `kube-*`, `default`, `logging`, `monitoring`) | nothing |
+| `RBAC errors` | our user has no `get pods` on that namespace | grant RBAC or exclude it explicitly |
+| `Other oc errors` | connection, token expired, unknown resource | investigate stderr in previous WARN line |
+| `Parse errors` | oc succeeded but returned malformed JSON | usually an oc/kubectl version mismatch |
+
+Exit code semantics:
+- `0` → COVERAGE: COMPLETE, safe to distribute the report
+- `3` → COVERAGE: PARTIAL, at least one namespace failed. **Do not treat as authoritative.**
+
+### Rollout no cliente (first run)
+
+Before running against the real cluster, walk through this checklist:
+
+1. `bash --version` → must be ≥ 4.0 (Linux/WSL default is fine).
+2. `make check` → 92 tests must pass, ruff/pyright/shellcheck clean.
+3. `az account show` → confirm you're pointed at the right subscription.
+4. `oc whoami && oc project` → confirm cluster identity.
+5. `make smoke-real ACR_NAME=<acr>` → smallest safe scope (critical CVEs only, report-only).
+6. Inspect `vulnerable_images_report.csv` for sanity (row count, sample rows).
+7. `./check_ocp.sh vulnerable_images_report.csv` → check the coverage summary.
+8. Only if `COVERAGE: COMPLETE`, continue with `make pipeline-local`.
+9. Open `vulnerability_report.html` and share with the team.
+
+Never combine steps 5 with block/unblock flags on the first run.
 
 ### What NEVER to run in a smoke test
 
