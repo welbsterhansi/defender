@@ -52,6 +52,7 @@ Primary consumers: platform SRE team (report), developers (remediation actions),
 | `report.py`           | Python   | Generates a self-contained HTML report with cluster health score, top CVEs, per-namespace breakdown, and executive analysis. |
 | `tests/`              | Python   | pytest suite with synthetic CSV fixtures. |
 | `pyproject.toml`      | -        | pytest, ruff, and pyright configuration. |
+| `lib/logging.sh`      | Bash     | Sourced by both shells. `init_logging <script> <mode> [args...]` opens `logs/run-YYYYMMDD-HHMMSS-<pid>.log` for structured critical events. `log_info`/`log_warn`/`log_error` write to stderr always and append to the file best-effort. **Never fails the caller**: any file-write error surfaces as a WARN and the script keeps running. Scrubs values of `--token`/`--password`/`--secret`/`--*key` flags in the header. |
 
 ## Running the pipeline
 
