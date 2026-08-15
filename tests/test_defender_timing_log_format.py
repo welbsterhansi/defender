@@ -13,6 +13,8 @@ Uses PATH-mocked `az` — no live Azure calls.
 """
 from __future__ import annotations
 
+import csv as csv_module
+import io
 import json
 import os
 import re
@@ -226,9 +228,10 @@ class TestCsvOutputUnchanged:
 
 class TestJqCleanBehavior:
     """PR-A moved per-row parsing from 18× (base64+jq) into one jq per page
-    that emits US-separated fields. A jq `clean` helper collapses `\\r` and
-    `\\n` inside string values so multi-line remediation text can't break
-    the row boundary or the field delimiter. These tests lock that behavior.
+    that emits US-separated fields. The jq `clean` helper strips characters
+    that would corrupt the pipeline: CR/LF (would create phantom CSV rows)
+    and 0x1F itself (would shift downstream columns because bash `read`
+    splits on it). These tests lock that behavior.
     """
 
     def test_multi_line_remediation_collapsed_to_single_line(
@@ -252,21 +255,33 @@ class TestJqCleanBehavior:
         assert "line two" in data_row
         assert "line three" in data_row
 
-    def test_us_char_inside_field_does_not_break_row(self, tmp_path: Path) -> None:
-        # A field containing the US (0x1F) delimiter itself must not eat
-        # subsequent columns. Since jq's clean() only strips CR/LF and
-        # csv_write_row runs a second sanitize, the row must still parse
-        # into 19 quoted values.
+    def test_us_char_inside_field_does_not_shift_downstream_columns(
+        self, tmp_path: Path
+    ) -> None:
+        # A field containing the US (0x1F) delimiter itself must be
+        # neutralised at the source (in jq's clean), otherwise bash `read`
+        # would split on it and shift every subsequent column left by one.
+        # We verify semantic column integrity: the CVE age we set (77) must
+        # end up in the cveAgeDays column, and lastPushedToRegistryUTC must
+        # hold the timestamp — not values shifted in from remediation.
         row = _row("d" * 64, "CVE-US", "myrepo")
         row["remediation"] = "before\x1fafter"
+        row["cveAgeDays"] = 77
+        row["lastPushedToRegistryUTC"] = "2026-01-15T10:00:00Z"
         pages = [{"data": [row], "skip_token": ""}]
         r = _run_defender(tmp_path, pages)
         assert r.returncode == 0, r.stderr
 
         csv = (tmp_path / "vulnerable_images_report.csv").read_text(encoding="utf-8")
-        lines = csv.splitlines()
-        assert len(lines) == 2, lines
-        # Same invariant as the shape test: 19 quoted values.
-        assert lines[1].count('"') == 38, (
-            f"row was mis-split by embedded 0x1F: {lines[1]!r}"
-        )
+        rows = list(csv_module.reader(io.StringIO(csv)))
+        assert len(rows) == 2, rows
+        header, data = rows
+        by_name = dict(zip(header, data, strict=True))
+        # Downstream columns landed where they belong.
+        assert by_name["cveAgeDays"] == "77", by_name
+        assert by_name["lastPushedToRegistryUTC"] == "2026-01-15T10:00:00Z", by_name
+        # And the remediation value survives as a single field, with the
+        # 0x1F collapsed to a space by clean().
+        assert "before" in by_name["remediation"]
+        assert "after" in by_name["remediation"]
+        assert "\x1f" not in by_name["remediation"]

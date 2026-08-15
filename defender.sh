@@ -1029,7 +1029,7 @@ while : ; do
     # `clean` collapses \r, \n and 0x1F inside string fields so multi-line
     # remediation text never breaks the delimiter or the row boundary.
     JQ_ROW_EXTRACT='
-        def clean(x): (x // "" | tostring | gsub("[\r\n]"; " "));
+        def clean(x): (x // "" | tostring | gsub("[\r\n\u001f]"; " "));
         .data[] | [
             clean(.repository),
             clean(.digest),
