@@ -222,10 +222,10 @@ run_graph_query() {
         err_preview=$(head -c 300 "$az_stderr" 2>/dev/null)
         rm -f "$az_stderr"
         LAST_QUERY_RETRIES=$attempt
-        echo "  [WARN] az graph query attempt ${attempt}/3 failed (rc=${rc}): ${err_preview:-<empty stderr, invalid JSON?>}" >&2
+        log_warn "az graph query attempt ${attempt}/3 failed rc=${rc}: ${err_preview:-<empty stderr, invalid JSON?>}"
         if [ "$attempt" -lt 3 ]; then
             local delay="${delays[$((attempt-1))]}"
-            echo "  [INFO] Retrying in ${delay}s..." >&2
+            log_info "az graph query retry backoff=${delay}s"
             sleep "$delay"
         fi
     done
@@ -347,6 +347,30 @@ if [ -z "$ACR_NAME" ]; then
     echo "Error: --acr-name is required."
     usage
 fi
+
+# Best-effort structured logging. Never gates the scan: if logs/ or the
+# file are unusable, init_logging logs a WARN and lets us keep running.
+# Compute mode first so the header + start line are meaningful.
+if [ "$LIST_BLOCKED" = true ];  then _LOG_MODE="list-blocked"
+elif [ -n "$IMAGE" ];            then _LOG_MODE="unblock-single"
+elif [ "$UNBLOCK_ALL" = true ];  then _LOG_MODE="unblock-all"
+elif [ "$UNBLOCK" = true ];      then _LOG_MODE="unblock"
+elif [ "$BLOCK_IMAGES" = true ]; then _LOG_MODE="block"
+elif [ -n "$SCAN_IMAGE" ];       then _LOG_MODE="scan-image"
+else                                  _LOG_MODE="report-only"
+fi
+[ "$DRY_RUN" = true ] && _LOG_MODE="${_LOG_MODE}+dry-run"
+
+# shellcheck source=lib/logging.sh
+source "$(dirname "$0")/lib/logging.sh"
+init_logging "defender.sh" "$_LOG_MODE" \
+    --acr-name "$ACR_NAME" \
+    --min-score "$MIN_SCORE" --max-score "$MAX_SCORE" \
+    ${REPOSITORY:+--repository "$REPOSITORY"} \
+    ${REPOSITORIES:+--repositories "$REPOSITORIES"} \
+    ${SCAN_IMAGE:+--scan-image "$SCAN_IMAGE"} \
+    ${IMAGE:+--image "$IMAGE"}
+log_info "start acr=$ACR_NAME mode=$_LOG_MODE score_range=${MIN_SCORE}..${MAX_SCORE}"
 
 # --repository, --repositories and --scan-image define the scan scope in
 # incompatible ways. Refuse ambiguous combinations up front instead of letting
@@ -918,10 +942,7 @@ while : ; do
     # message so operators don't consume a truncated CSV as authoritative.
     # Call directly (no $(...)) so globals set by the function survive.
     if ! run_graph_query "$QUERY_FILE" "$SKIP_TOKEN"; then
-        echo "" >&2
-        echo "ERROR: az graph query failed on page ${PAGE_NUM} after 3 attempts." >&2
-        echo "       Aborting to avoid producing a partial CSV." >&2
-        echo "       Processed so far: ${TOTAL_PROCESSED} rows across $((PAGE_NUM - 1)) page(s)." >&2
+        log_error "az graph query failed on page ${PAGE_NUM} after 3 attempts; aborting (processed=${TOTAL_PROCESSED} pages=$((PAGE_NUM - 1)))"
         exit 2
     fi
     RESPONSE="$LAST_QUERY_RESPONSE"
@@ -1055,6 +1076,8 @@ echo "Processing complete."
 if [ "$BLOCK_IMAGES" = false ] && [ "$UNBLOCK" = false ]; then
     echo "Total images found: $TOTAL_PROCESSED across ${PAGE_NUM} page(s)"
     echo "Report saved to: $REPORT_FILE"
+    log_info "end total_processed=${TOTAL_PROCESSED} pages=${PAGE_NUM} report_file=${REPORT_FILE}"
 else
     echo "Total images processed: $TOTAL_PROCESSED across ${PAGE_NUM} page(s)"
+    log_info "end total_processed=${TOTAL_PROCESSED} pages=${PAGE_NUM} mode=${_LOG_MODE}"
 fi

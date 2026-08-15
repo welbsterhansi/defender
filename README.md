@@ -100,6 +100,35 @@ python3 expandcsv.py
 python3 report.py
 ```
 
+### Logs
+
+Every run of `defender.sh` and `check_ocp.sh` records **critical events only** — start, retry, error, coverage, generated file paths — to a timestamped file in `logs/`. The terminal output is untouched; the log is a compact operational trail for auditing and troubleshooting.
+
+```
+logs/
+├── run-20260815-115734-48146.log   # defender.sh
+└── run-20260815-120214-48892.log   # check_ocp.sh
+```
+
+- **Name**: `run-YYYYMMDD-HHMMSS-<pid>.log` (UTC + PID = collision-safe under parallel CI).
+- **Header**: 8 lines with timestamp, script, mode, args, log path, pid.
+- **Events**: `[YYYY-MM-DDTHH:MM:SSZ] LEVEL  message` — one per critical event. Not a stdout mirror.
+- **Best-effort**: if `logs/` can't be created or the file becomes unwritable at runtime, a WARN surfaces on stderr and the script keeps running normally. **Logging never gates the scan.**
+- **Secrets**: values of flags whose name matches `--token` / `--password` / `--secret` / `--*key` become `<redacted>` in the header. Do not pass secrets as CLI args regardless.
+
+Collecting from CI:
+
+```yaml
+- name: Upload defender logs
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: defender-logs
+    path: logs/run-*.log
+```
+
+Local cleanup: `make clean` removes `logs/` along with the other generated artifacts.
+
 ### Reading `check_ocp.sh` coverage output
 
 Each run prints a `=== Coverage summary ===` block. **Trust the report only when it says `COVERAGE: COMPLETE`.**

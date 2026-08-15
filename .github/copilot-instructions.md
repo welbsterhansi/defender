@@ -86,6 +86,12 @@ These are the rules Copilot must follow when suggesting or making changes.
 - New features that surface in the HTML must be documented in the "Reading
   coverage output" style: what the field means, when it appears, what to do
   with it.
+- New shell entry points must `source lib/logging.sh`, call `init_logging`
+  with a short mode name and the safe subset of their args, and use
+  `log_info` / `log_warn` / `log_error` at critical points (start, retry,
+  errors, coverage, generated files). Logging is **best-effort**: file
+  writes are guarded and a logging failure never breaks the engine.
+  Never pass secrets as CLI args, even with the scrubber in place.
 
 ---
 

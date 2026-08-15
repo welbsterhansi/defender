@@ -22,6 +22,14 @@ if [ ! -f "$LIST_FILE" ]; then
     exit 1
 fi
 
+# Best-effort structured logging. Never gates the cross-reference: if
+# logs/ or the file are unusable, init_logging logs a WARN and the run
+# continues (terminal output stays as-is).
+# shellcheck source=lib/logging.sh
+source "$(dirname "$0")/lib/logging.sh"
+init_logging "check_ocp.sh" "cross-reference" "$LIST_FILE" "$OUTPUT_FILE"
+log_info "start list_file=$LIST_FILE output_file=$OUTPUT_FILE"
+
 echo "A carregar lista de vulnerabilidades de: $LIST_FILE ..."
 # Pré-parseia LIST_FILE em memória:
 #   CSV_BY_DIGEST[<digest>] = "linha1\x1elinha2\x1e..."
@@ -113,11 +121,13 @@ for project in $PROJECTS; do
             NS_RBAC_ERR=$((NS_RBAC_ERR + 1))
             RBAC_NAMESPACES+=("$project")
             echo "  [WARN] $project: RBAC error — grant get/list pods in namespace '$project' or exclude it from the platform filter" >&2
+            log_warn "namespace=$project RBAC_ERR"
         else
             NS_OC_ERR=$((NS_OC_ERR + 1))
             FAILED_NAMESPACES+=("$project")
             err_preview=$(head -c 200 "$oc_stderr" | tr '\n' ' ' || true)
             echo "  [WARN] $project: oc failed — ${err_preview:-no stderr}" >&2
+            log_warn "namespace=$project OC_ERR: ${err_preview:-no stderr}"
         fi
         rm -f "$oc_stderr"
         continue
@@ -129,6 +139,7 @@ for project in $PROJECTS; do
         NS_PARSE_ERR=$((NS_PARSE_ERR + 1))
         FAILED_NAMESPACES+=("$project")
         echo "  [WARN] $project: parse error — jq could not extract pods from oc JSON" >&2
+        log_warn "namespace=$project PARSE_ERR"
         continue
     fi
 
@@ -207,9 +218,11 @@ if [ "$NS_FAILED_TOTAL" -gt 0 ]; then
         echo "    Failed:       ${FAILED_NAMESPACES[*]}"
     fi
     COVERAGE_EXIT=3
+    log_warn "COVERAGE PARTIAL failed=${NS_FAILED_TOTAL} rbac=${NS_RBAC_ERR} oc=${NS_OC_ERR} parse=${NS_PARSE_ERR} pods=${POD_COUNT} matches=${MATCH_COUNT}"
 else
     echo "  COVERAGE: COMPLETE"
     COVERAGE_EXIT=0
+    log_info "COVERAGE COMPLETE analyzed=${NS_SUCCESS_WITH_PODS} no_pods=${NS_NO_PODS} pods=${POD_COUNT} matches=${MATCH_COUNT}"
 fi
 echo ""
 
@@ -217,6 +230,7 @@ echo ""
 if [ ! -s "$RAW_OUTPUT" ] || [ "$(wc -l < "$RAW_OUTPUT")" -le 1 ]; then
     echo "Nenhuma vulnerabilidade encontrada nos workloads."
     echo "NAMESPACE,PARENT_TYPE,PARENT_NAME,REPOSITORY,DIGEST,TAG,CVE_COUNT,CRITICALITY,CVSS_SCORE,CVE_LIST,CVE_SEVERITY_MAP,PACKAGE_CATEGORY,PACKAGE_LANGUAGE,PACKAGE_NAME,CURRENT_VERSION,FIXED_VERSION,PATCHABLE,REMEDIATION,FIX_STATUS,CVE_AGE_DAYS,IS_IN_EXPLOIT_KIT,HAS_PUBLISHED_EXPLOIT,HAS_VERIFIED_EXPLOIT,LAST_PUSHED_TO_REGISTRY_UTC" > "$OUTPUT_FILE"
+    log_info "end output_file=$OUTPUT_FILE coverage_exit=${COVERAGE_EXIT} findings=0"
     exit "$COVERAGE_EXIT"
 fi
 
@@ -228,8 +242,10 @@ echo "Processando e agrupando resultados..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if ! python3 "$SCRIPT_DIR/group_findings.py" "$RAW_OUTPUT" "$OUTPUT_FILE"; then
     echo "Erro: falha ao agrupar resultados." >&2
+    log_error "group_findings.py failed"
     exit 1
 fi
 
 echo "Processamento concluído."
+log_info "end output_file=$OUTPUT_FILE coverage_exit=${COVERAGE_EXIT}"
 exit "$COVERAGE_EXIT"
