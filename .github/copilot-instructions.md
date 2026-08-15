@@ -31,6 +31,21 @@ These are the rules Copilot must follow when suggesting or making changes.
 - A change to a shell script must pass `bash -n` and, when applicable, must
   validate the embedded tool at runtime — `jq` expressions with mock JSON,
   `az` / `oc` interactions via `PATH`-mocked binaries.
+- Any new executable shell entry point must be added to `make lint` (`bash -n`
+  and `shellcheck --severity=warning`) and must have a tiny happy-path smoke
+  test or Make target that runs locally with fake inputs, exits `0`, and emits
+  no unexpected stderr.
+- Benchmark and diagnostic scripts must be tested for stable output shape and
+  counters, but tests must not assert absolute timing values.
+- Heredocs that generate shell scripts are runtime-risky under `set -u`: if the
+  generated body contains inner-script variables such as `$KQL`, `$1`, `$PATH`,
+  command substitutions, or backticks, use a quoted heredoc (`<<'EOF'`) when
+  possible. If outer interpolation is required, escape every inner-script
+  expansion (`\$VAR`, `\$(...)`) and run the generated script path in a smoke
+  test.
+- Do not treat `bash -n` or `shellcheck` as sufficient for generated scripts;
+  they can miss heredoc expansion errors that only appear when the parent
+  script runs.
 
 ## 3. Pipeline
 
@@ -94,6 +109,24 @@ These are the rules Copilot must follow when suggesting or making changes.
   Never pass secrets as CLI args, even with the scrubber in place.
 
 ---
+
+## Performance / telemetry
+
+`defender.sh` emits a stable per-page timing line via `log_info`:
+
+```
+page N batch=... total=... retries=... tag_api_calls=... timings_ms=graph_query:NNN tag_resolve:NNN rows:NNN total:NNN
+```
+
+Field order and names are a public interface — dashboards, CI graphs and `scripts/benchmark-defender.sh` parse it. If you must change the layout, update `tests/test_defender_timing_log_format.py` and the benchmark script in the same PR.
+
+For performance work, run the local benchmark first (no live Azure needed):
+
+```bash
+scripts/benchmark-defender.sh --pages 3 --rows-per-page 1000 --latency-ms 20
+```
+
+Capture before/after numbers in the PR description. Never assert on absolute timing values in tests.
 
 ## Merge gate
 

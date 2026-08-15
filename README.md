@@ -100,6 +100,36 @@ python3 expandcsv.py
 python3 report.py
 ```
 
+### Timing telemetry
+
+Each page of the ARG pagination loop in `defender.sh` emits a structured line to the log (task #42):
+
+```
+[2026-08-16T10:23:45Z] INFO  page 3 batch=1000 total=3000 retries=0 tag_api_calls=340 timings_ms=graph_query:1240 tag_resolve:32100 rows:15400 total:48800
+```
+
+Fields:
+- `page` — 1-based page number
+- `batch` — rows returned by ARG on this page (≤ 1000, server-side max)
+- `total` — cumulative rows written so far
+- `retries` — retries used by `run_graph_query` on this specific page
+- `tag_api_calls` — how many `az repository show-tags` calls the tag cache made
+- `timings_ms` — per-phase wall-clock in milliseconds:
+  - `graph_query` — Azure Resource Graph round-trip (network + server compute)
+  - `tag_resolve` — tag cache build (currently 1 call per unique digest)
+  - `rows` — CSV parsing + write for the whole batch
+  - `total` — sum of the phases (small delta = overhead)
+
+Format is stable — do not reorder without updating `scripts/benchmark-defender.sh` and the format tests in `tests/test_defender_timing_log_format.py`.
+
+**Local benchmark** (no real Azure needed):
+
+```bash
+scripts/benchmark-defender.sh --pages 3 --rows-per-page 1000 --repos 20 --latency-ms 20
+```
+
+Simulates configurable page size, repo diversity, and per-call latency. Prints per-page timings, aggregate breakdown, and API call counts. Useful for measuring the impact of upcoming optimizations (PR-A jq refactor, PR-B tag cache per repo) without waiting for a real ACR scan.
+
 ### Logs
 
 Every run of `defender.sh` and `check_ocp.sh` records **critical events only** — start, retry, error, coverage, generated file paths — to a timestamped file in `logs/`. The terminal output is untouched; the log is a compact operational trail for auditing and troubleshooting.
