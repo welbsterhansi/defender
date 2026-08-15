@@ -74,3 +74,81 @@ class TestRepoToDashedPath:
     def test_preserves_dashes_and_dots(self) -> None:
         assert _bash_call("repo_to_dashed_path",
                           "a.b-c/d.e-f") == "a.b-c-d.e-f"
+
+
+def _bash_call_multi(fn: str, *args: str) -> str:
+    """Same as _bash_call but forwards multiple positional args."""
+    text = DEFENDER_SH.read_text(encoding="utf-8")
+    marker = "# Function to display usage"
+    helpers_only = text.split(marker, 1)[0]
+    quoted = " ".join(f'"$"{i+1}' for i in range(len(args)))
+    quoted = " ".join(f'"${{{i+1}}}"' for i in range(len(args)))
+    result = subprocess.run(
+        ["bash", "-c", f'{helpers_only}\n{fn} {quoted}', "_", *args],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, (
+        f"bash exited {result.returncode}\nstderr:\n{result.stderr}"
+    )
+    return result.stdout
+
+
+class TestParseRepoList:
+    """
+    Contract: `parse_repo_list` splits comma-separated input into one entry
+    per line, trims whitespace, drops empty entries, and de-duplicates keeping
+    first occurrence. Pure — no side effects, no trailing newline gremlins.
+    """
+
+    def test_simple_list(self) -> None:
+        out = _bash_call("parse_repo_list", "a,b,c")
+        assert out.strip().split("\n") == ["a", "b", "c"]
+
+    def test_trims_whitespace(self) -> None:
+        out = _bash_call("parse_repo_list", "  a , b ,c  ")
+        assert out.strip().split("\n") == ["a", "b", "c"]
+
+    def test_dedups_preserving_first(self) -> None:
+        out = _bash_call("parse_repo_list", "a,b,a,c,b")
+        assert out.strip().split("\n") == ["a", "b", "c"]
+
+    def test_drops_empty_entries(self) -> None:
+        out = _bash_call("parse_repo_list", "a,,b,,,c,")
+        assert out.strip().split("\n") == ["a", "b", "c"]
+
+    def test_single_entry(self) -> None:
+        out = _bash_call("parse_repo_list", "only")
+        assert out.strip() == "only"
+
+    def test_empty_input(self) -> None:
+        # Empty string yields empty output (no rows). Callers must check
+        # for this to distinguish "no filter" from "filter with 0 entries".
+        assert _bash_call("parse_repo_list", "").strip() == ""
+
+
+class TestBuildReposFilterExpr:
+    """
+    Contract: emits `prop contains "r1" or prop contains "r2"` style KQL
+    string. Empty when no repos are passed. Property name is used verbatim
+    (caller is responsible for using the KQL-appropriate path).
+    """
+
+    def test_single_repo(self) -> None:
+        out = _bash_call_multi("build_repos_filter_expr", "p.name", "app")
+        assert out == 'p.name contains "app"'
+
+    def test_two_repos_joined_with_or(self) -> None:
+        out = _bash_call_multi("build_repos_filter_expr",
+                               "p.name", "app", "payments")
+        assert out == 'p.name contains "app" or p.name contains "payments"'
+
+    def test_three_repos(self) -> None:
+        out = _bash_call_multi("build_repos_filter_expr",
+                               "p.name", "a", "b", "c")
+        assert out == ('p.name contains "a" or '
+                       'p.name contains "b" or '
+                       'p.name contains "c"')
+
+    def test_empty_repos_yields_empty(self) -> None:
+        out = _bash_call_multi("build_repos_filter_expr", "p.name")
+        assert out == ""

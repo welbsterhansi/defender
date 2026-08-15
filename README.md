@@ -27,6 +27,9 @@ Target runtime is Linux / WSL (bash 4+). macOS works for local dev if you instal
 ./defender.sh --acr-name <ACR_NAME> --min-score 9 --max-score 10
 #    → vulnerable_images_report.csv
 
+# Scope to a curated set of repositories (multi-repo, single run):
+./defender.sh --acr-name <ACR_NAME> --min-score 9 --repositories app,payments,catalog
+
 # 2. Cross-reference with running OpenShift workloads
 ./check_ocp.sh vulnerable_images_report.csv resultado_cruzamento.csv
 #    → resultado_cruzamento.csv (one row per workload+image, CVEs aggregated)

@@ -12,6 +12,7 @@ set -euo pipefail
 MIN_SCORE=9
 MAX_SCORE=10
 REPOSITORY=""
+REPOSITORIES=""
 ACR_NAME=""
 DRY_RUN=false
 DEBUG=false
@@ -102,6 +103,40 @@ repo_to_dashed_path() {
 }
 
 # ---------------------------------------------------------------------------
+# Parse a comma-separated repository list into one-per-line output, trimmed
+# and de-duplicated (first occurrence wins). Empty entries are dropped.
+# Example: "  app , payments,, app , catalog " → "app\npayments\ncatalog"
+# Pure function — extracted to keep the caller readable and to make it
+# unit-testable via tests/test_defender_helpers.py.
+# ---------------------------------------------------------------------------
+parse_repo_list() {
+    printf '%s' "$1" | tr ',' '\n' | awk '
+        {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if ($0 != "" && !seen[$0]++) print
+        }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Build a KQL "OR" expression over `contains` filters. Same pattern the
+# single-repo path uses; extended here for --repositories.
+# Example:
+#   build_repos_filter_expr "prop.name" app payments  →
+#     prop.name contains "app" or prop.name contains "payments"
+# Returns empty string when no repos are passed (caller decides).
+# ---------------------------------------------------------------------------
+build_repos_filter_expr() {
+    local prop="$1"; shift
+    local expr="" sep=""
+    for r in "$@"; do
+        expr+="${sep}${prop} contains \"${r}\""
+        sep=" or "
+    done
+    printf '%s' "$expr"
+}
+
+# ---------------------------------------------------------------------------
 # Wrap `az graph query` with retry+backoff and JSON validation. On success
 # populates two globals (LAST_QUERY_RESPONSE, LAST_QUERY_RETRIES) so the
 # caller can invoke the function directly without command substitution —
@@ -161,6 +196,8 @@ usage() {
     echo "  --min-score          Minimum CVSS score to filter (Default: 9)"
     echo "  --max-score          Maximum CVSS score to filter (Default: 10)"
     echo "  --repository, -r     Specific repository to filter (Optional)"
+    echo "  --repositories       Comma-separated list of repository substrings to filter (e.g., app,payments,catalog)"
+    echo "                       Mutually exclusive with --repository and --scan-image"
     echo "  --dry-run, -d        Print commands without executing"
     echo "  --block-images       BLOCK vulnerable images (default: report only)"
     echo "  --unblock            UNBLOCK vulnerable images based on CVE query"
@@ -225,6 +262,9 @@ usage() {
     echo "  # Scan a specific digest"
     echo "  $0 --acr-name myacr --scan-image base-images/ubi9-openjdk17@sha256:abc123..."
     echo ""
+    echo "  # Scan a curated list of repositories (multi-repo report)"
+    echo "  $0 --acr-name myacr --min-score 9 --repositories app,payments,catalog"
+    echo ""
     echo "By default, this script only generates a CSV report without blocking any images."
     exit 1
 }
@@ -236,6 +276,7 @@ while [[ "$#" -gt 0 ]]; do
         --min-score) MIN_SCORE="$2"; shift ;;
         --max-score) MAX_SCORE="$2"; shift ;;
         --repository|-r) REPOSITORY="$2"; shift ;;
+        --repositories) REPOSITORIES="$2"; shift ;;
         --dry-run|-d) DRY_RUN=true ;;
         --block-images) BLOCK_IMAGES=true ;;
         --unblock) UNBLOCK=true ;;
@@ -255,6 +296,19 @@ done
 if [ -z "$ACR_NAME" ]; then
     echo "Error: --acr-name is required."
     usage
+fi
+
+# --repository, --repositories and --scan-image define the scan scope in
+# incompatible ways. Refuse ambiguous combinations up front instead of letting
+# a downstream filter silently ignore one of them.
+_scope_flags=0
+[ -n "$REPOSITORY" ]   && _scope_flags=$((_scope_flags + 1))
+[ -n "$REPOSITORIES" ] && _scope_flags=$((_scope_flags + 1))
+[ -n "$SCAN_IMAGE" ]   && _scope_flags=$((_scope_flags + 1))
+if [ "$_scope_flags" -gt 1 ]; then
+    echo "Error: --repository, --repositories and --scan-image are mutually exclusive." >&2
+    echo "       Pick one scoping flag." >&2
+    exit 1
 fi
 
 # Check prerequisites
@@ -298,6 +352,36 @@ if [ -n "$REPOSITORY" ]; then
     REPO_COUNT=$(echo "$ALL_REPOS" | grep -ic "$REPOSITORY" || true)
     if [ "$REPO_COUNT" -gt 5 ]; then
         echo "  ... and $((REPO_COUNT - 5)) more"
+    fi
+fi
+
+# Validate --repositories list (if provided). Every filter substring must
+# match at least one real repository, otherwise the caller likely typoed
+# and the scan would silently miss that repo without warning.
+if [ -n "$REPOSITORIES" ]; then
+    echo "Validating repositories filter '$REPOSITORIES'..."
+    ALL_REPOS=$(list_all_repositories "$ACR_NAME")
+    missing=()
+    matched_any=0
+    while IFS= read -r _r; do
+        [ -z "$_r" ] && continue
+        if echo "$ALL_REPOS" | grep -qi "$_r"; then
+            matched_any=1
+            _n=$(echo "$ALL_REPOS" | grep -ic "$_r" || true)
+            printf '  - %-40s (%d match(es))\n' "$_r" "$_n"
+        else
+            missing+=("$_r")
+        fi
+    done < <(parse_repo_list "$REPOSITORIES")
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "Error: no repositories in '$ACR_NAME' match: ${missing[*]}" >&2
+        echo "       Fix the typos or drop the entries from --repositories." >&2
+        exit 1
+    fi
+    if [ "$matched_any" -eq 0 ]; then
+        echo "Error: --repositories filter matched zero repositories." >&2
+        exit 1
     fi
 fi
 
@@ -606,6 +690,23 @@ elif [ -n "$REPOSITORY" ]; then
     EARLY_FILTER_A="| where properties.additionalData.artifactDetails.repositoryName contains \"$REPOSITORY\""
     _REPO_DASHED=$(repo_to_dashed_path "$REPOSITORY")
     EARLY_FILTER_B="| where properties.resourceDetails.Id contains \"$_REPO_DASHED\""
+elif [ -n "$REPOSITORIES" ]; then
+    # Same `contains` semantics as --repository, extended with OR across the
+    # parsed list. The KQL core is untouched — this only extends the injected
+    # filter snippet the single-repo path already used.
+    mapfile -t _repos_list < <(parse_repo_list "$REPOSITORIES")
+    _expr_a=$(build_repos_filter_expr \
+        "properties.additionalData.artifactDetails.repositoryName" \
+        "${_repos_list[@]}")
+    EARLY_FILTER_A="| where $_expr_a"
+    _dashed_list=()
+    for _r in "${_repos_list[@]}"; do
+        _dashed_list+=("$(repo_to_dashed_path "$_r")")
+    done
+    _expr_b=$(build_repos_filter_expr \
+        "properties.resourceDetails.Id" \
+        "${_dashed_list[@]}")
+    EARLY_FILTER_B="| where $_expr_b"
 fi
 
 # Union of both assessment shapes to ensure full coverage:

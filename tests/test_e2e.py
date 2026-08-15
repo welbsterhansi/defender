@@ -269,6 +269,68 @@ def test_e2e_missing_required_column_raises(
 # No accidental network / subprocess calls in the offline pipeline
 # ---------------------------------------------------------------------------
 
+def test_exploit_flags_survive_full_pipeline(
+    defender_csv_normal: Path,
+    cruzamento_csv_new: Path,
+    tmp_path: Path,
+) -> None:
+    """
+    Regression guard for task #37: adding --repositories to defender.sh must
+    NOT change how exploit flags are interpreted downstream.
+
+    Fixture: `defender_csv_normal` has CVE-2024-0002 flagged as
+    hasVerifiedExploit=true on `myapp/backend@sha256:aaa111`, which is used by
+    `prd-fad/Deployment/backend` in `cruzamento_csv_new`.
+
+    Contract: that flag must survive every stage — the defender index, the
+    expand step, the on-disk expanded.csv, and the final rendered HTML (as a
+    red-circle icon).
+    """
+    # Stage 1: defender data loaded — flag reachable in the index
+    idx_full, idx_digest, idx_prefix = expandcsv.load_vulnerability_data(
+        str(defender_csv_normal)
+    )
+    verified_key = ("myapp/backend", "sha256:aaa111", "CVE-2024-0002")
+    assert verified_key in idx_full, "defender fixture must have the CVE"
+    assert idx_full[verified_key]["HAS_VERIFIED_EXPLOIT"] == "true", (
+        "verified-exploit flag lost on load_vulnerability_data"
+    )
+
+    # Stage 2: expand_cves preserves the flag per (workload, CVE)
+    rows = expandcsv.expand_cves(
+        str(cruzamento_csv_new), idx_full, idx_digest, idx_prefix
+    )
+    verified_rows = [r for r in rows if r["CVE_ID"] == "CVE-2024-0002"]
+    assert verified_rows, "expand_cves dropped the CVE"
+    for r in verified_rows:
+        assert r["HAS_VERIFIED_EXPLOIT"] == "true", (
+            f"verified-exploit flag lost on expand_cves: {r!r}"
+        )
+
+    # Stage 3: expanded.csv on disk keeps the column populated
+    expanded_path = tmp_path / "expanded.csv"
+    expandcsv.write_output(rows, str(expanded_path))
+    with expanded_path.open(encoding="utf-8", newline="") as f:
+        disk_rows = list(csv.DictReader(f))
+    disk_verified = [r for r in disk_rows if r["CVE_ID"] == "CVE-2024-0002"]
+    assert disk_verified
+    for r in disk_verified:
+        assert r["HAS_VERIFIED_EXPLOIT"] == "true", (
+            "verified-exploit flag lost on write_output"
+        )
+
+    # Stage 4: report picks it up and renders 🔴 for verified exploit
+    ns = report.load_data(str(cruzamento_csv_new), str(expanded_path))
+    html = report.build_html(ns)
+    assert "🔴" in html, (
+        "verified-exploit CVE did not render the red-circle icon in HTML"
+    )
+    # And the weaponized KPI counts it (>= 1 entry weaponized)
+    assert 'class="kpi-num critical"' in html, (
+        "Weaponized KPI should be red when >=1 exploit is present"
+    )
+
+
 def test_e2e_no_subprocess_calls(
     monkeypatch: pytest.MonkeyPatch,
     defender_csv_normal: Path,

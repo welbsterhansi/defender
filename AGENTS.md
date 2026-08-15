@@ -85,6 +85,7 @@ python3 report.py
 | `--image <ref>`       | Unblock a single `repo@sha256:...` |
 | `--list-blocked`      | Enumerates currently blocked manifests |
 | `--scan-image <ref>`  | Scan a specific repo, tag, or digest |
+| `--repositories <l>`  | Comma-separated list of repository substrings to scope the scan (mutually exclusive with `--repository` and `--scan-image`; each entry validated against `az acr repository list`) |
 | `--dry-run`           | Print commands without executing |
 | `--auto-approve`      | Skip interactive confirmation |
 | `--debug`             | Print the generated KQL and run a diagnostic ARG query |
