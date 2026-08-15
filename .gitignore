@@ -19,6 +19,7 @@ blocked_images_report.csv
 resultado_cruzamento.csv
 expanded.csv
 vulnerability_report.html
+logs/
 
 # macOS
 .DS_Store

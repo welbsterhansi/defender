@@ -29,7 +29,7 @@ lint:
 	@bash -n defender.sh
 	@bash -n check_ocp.sh
 	@echo "==> shellcheck (warning+ severity; info/style are advisory)"
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck --severity=warning defender.sh check_ocp.sh; else echo "(shellcheck not installed, skipping)"; fi
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck --severity=warning defender.sh check_ocp.sh lib/logging.sh; else echo "(shellcheck not installed, skipping)"; fi
 
 check: test lint
 
@@ -68,4 +68,5 @@ clean:
 	rm -f vulnerable_images_report.csv blocked_images_report.csv
 	rm -f resultado_cruzamento.csv expanded.csv vulnerability_report.html
 	rm -f *.csv.tmp.*
+	rm -rf logs/
 	rm -rf __pycache__ tests/__pycache__ .pytest_cache .ruff_cache

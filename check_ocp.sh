@@ -22,6 +22,10 @@ if [ ! -f "$LIST_FILE" ]; then
     exit 1
 fi
 
+# shellcheck source=lib/logging.sh
+source "$(dirname "$0")/lib/logging.sh"
+init_logging "check_ocp.sh" "cross-reference" "$LIST_FILE" "$OUTPUT_FILE"
+
 echo "A carregar lista de vulnerabilidades de: $LIST_FILE ..."
 # Pré-parseia LIST_FILE em memória:
 #   CSV_BY_DIGEST[<digest>] = "linha1\x1elinha2\x1e..."

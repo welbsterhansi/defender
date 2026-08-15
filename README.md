@@ -100,6 +100,35 @@ python3 expandcsv.py
 python3 report.py
 ```
 
+### Logs
+
+Every run of `defender.sh` and `check_ocp.sh` mirrors its full stdout+stderr into a timestamped file under `logs/`:
+
+```
+logs/
+├── run-20260815-115734.log   # defender.sh, report-only
+└── run-20260815-120214.log   # check_ocp.sh, cross-reference
+```
+
+- **Format**: UTC timestamp — sorts naturally, safe to collect from any timezone.
+- **Header**: first ~8 lines record script, mode, args, log path, pid.
+- **Content**: identical to what the terminal showed in real time (the file mirrors, it doesn't replace).
+- **Secrets**: flags whose name hints at credentials (`--token`, `--password`, `--secret`, `--api-key`, ...) have their following value replaced with `<redacted>` in the header. Never pass secrets as CLI args regardless.
+
+Collecting from CI:
+
+```yaml
+# GitHub Actions example
+- name: Upload defender logs
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: defender-logs
+    path: logs/run-*.log
+```
+
+Local cleanup: `make clean` removes `logs/` along with the other generated artifacts.
+
 ### Reading `check_ocp.sh` coverage output
 
 Each run prints a `=== Coverage summary ===` block. **Trust the report only when it says `COVERAGE: COMPLETE`.**

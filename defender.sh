@@ -348,6 +348,29 @@ if [ -z "$ACR_NAME" ]; then
     usage
 fi
 
+# Persist all output to logs/run-*.log while keeping the terminal live.
+# Compute a short human-readable mode first so operators can scan the log
+# header at a glance and CI can grep by mode.
+if [ "$LIST_BLOCKED" = true ];  then _LOG_MODE="list-blocked"
+elif [ -n "$IMAGE" ];            then _LOG_MODE="unblock-single"
+elif [ "$UNBLOCK_ALL" = true ];  then _LOG_MODE="unblock-all"
+elif [ "$UNBLOCK" = true ];      then _LOG_MODE="unblock"
+elif [ "$BLOCK_IMAGES" = true ]; then _LOG_MODE="block"
+elif [ -n "$SCAN_IMAGE" ];       then _LOG_MODE="scan-image"
+else                                  _LOG_MODE="report-only"
+fi
+[ "$DRY_RUN" = true ] && _LOG_MODE="${_LOG_MODE}+dry-run"
+
+# shellcheck source=lib/logging.sh
+source "$(dirname "$0")/lib/logging.sh"
+init_logging "defender.sh" "$_LOG_MODE" \
+    --acr-name "$ACR_NAME" \
+    --min-score "$MIN_SCORE" --max-score "$MAX_SCORE" \
+    ${REPOSITORY:+--repository "$REPOSITORY"} \
+    ${REPOSITORIES:+--repositories "$REPOSITORIES"} \
+    ${SCAN_IMAGE:+--scan-image "$SCAN_IMAGE"} \
+    ${IMAGE:+--image "$IMAGE"}
+
 # --repository, --repositories and --scan-image define the scan scope in
 # incompatible ways. Refuse ambiguous combinations up front instead of letting
 # a downstream filter silently ignore one of them.

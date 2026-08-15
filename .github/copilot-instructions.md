@@ -80,6 +80,11 @@ These are the rules Copilot must follow when suggesting or making changes.
 
 - Update `README.md` and `AGENTS.md` whenever you change the operator flow,
   make targets, CSV schema, or operational behavior.
+- New shell entry points must `source lib/logging.sh` and call `init_logging`
+  with a short mode name and the safe subset of their args. That ensures the
+  run is captured under `logs/run-*.log` for auditing and CI artifact
+  collection. Never pass tokens or secrets as CLI args — even with the
+  scrubber, credentials belong in environment or Azure keychain.
 - Error messages must state the cause and the corrective action. Example:
   `"grant get/list pods in namespace '<X>' or exclude it from the platform filter"`
   — not just `"forbidden"`.

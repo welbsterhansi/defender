@@ -50,6 +50,7 @@ Primary consumers: platform SRE team (report), developers (remediation actions),
 | `group_findings.py`   | Python   | Called by `check_ocp.sh` to aggregate the flat CSV into one row per unique `(namespace, workload, image)` — CVE list, severity map, max CVSS, carried package/exploit fields. Was previously inline `python3 -c '...'`. |
 | `expandcsv.py`        | Python   | Explodes the grouped CSV into one row per unique `(namespace, workload, repository, digest, cveId)`. Uses a 3-level lookup (full → repo+cve → digest-prefix) to tolerate multi-arch manifests. |
 | `report.py`           | Python   | Generates a self-contained HTML report with cluster health score, top CVEs, per-namespace breakdown, and executive analysis. |
+| `lib/logging.sh`      | Bash     | Sourced by both shells. `init_logging <script> <mode> [args...]` creates `logs/run-YYYYMMDD-HHMMSS.log` (UTC) and tees all stdout+stderr into it, preserving realtime terminal output. Scrubs values of `--token`/`--password`/`--secret`/`--key` flags in the header. |
 | `tests/`              | Python   | pytest suite with synthetic CSV fixtures. |
 | `pyproject.toml`      | -        | pytest, ruff, and pyright configuration. |
 
