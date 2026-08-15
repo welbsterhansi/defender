@@ -142,86 +142,145 @@ class TestScopeFlagMutualExclusion:
 
 
 # ---------------------------------------------------------------------------
-# Validation — every entry in --repositories must match at least one repo
+# Validation — CONTROLLED list: exact match, empty/duplicate fail loud
 # ---------------------------------------------------------------------------
 
 class TestRepositoriesValidation:
-    def test_all_repos_matched(self, tmp_path: Path) -> None:
+    def test_all_repos_matched_exactly(self, tmp_path: Path) -> None:
+        # Fixture repos are app-backend / payments-api / catalog-svc. Pass
+        # the exact names — validation must accept.
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
-            "--repositories", "app,payments,catalog",
+            "--repositories", "app-backend,payments-api,catalog-svc",
         ])
-        # exit 0 — happy path; report file will be written with just the header
-        # since our fake az returns empty data.
         assert r.returncode == 0, r.stderr
-        # Validation prints each filter substring that matched at least one repo.
-        # Fixture has app-backend / payments-api / catalog-svc — one match each.
-        assert "app" in r.stdout and "1 match" in r.stdout
-        assert "payments" in r.stdout
-        assert "catalog" in r.stdout
+        assert "app-backend (exact match)" in r.stdout
+        assert "payments-api (exact match)" in r.stdout
+        assert "catalog-svc (exact match)" in r.stdout
 
-    def test_typo_in_list_fails_early(self, tmp_path: Path) -> None:
+    def test_substring_only_fails(self, tmp_path: Path) -> None:
+        # Fixture has `app-backend` but NOT `app` — exact match must reject.
+        # This is THE regression the review-round fixed: `contains` used to
+        # accept this, capturing `app-backend` under `--repositories app`.
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
-            "--repositories", "app,xyz-not-a-real-repo",
+            "--repositories", "app",
         ])
         assert r.returncode == 1
-        assert "xyz-not-a-real-repo" in r.stderr
+        assert "app" in r.stderr
+        assert "not found" in r.stderr.lower()
 
-    def test_empty_list_after_trim_fails(self, tmp_path: Path) -> None:
-        # `,,,` parses to zero entries — should fail loudly, not silently scan
-        # the whole ACR.
+    def test_typo_fails_early(self, tmp_path: Path) -> None:
+        r = _run_defender(tmp_path, [
+            "--acr-name", "myacr",
+            "--repositories", "app-backend,xyz-not-real",
+        ])
+        assert r.returncode == 1
+        assert "xyz-not-real" in r.stderr
+
+    def test_empty_middle_entry_fails(self, tmp_path: Path) -> None:
+        r = _run_defender(tmp_path, [
+            "--acr-name", "myacr",
+            "--repositories", "app-backend,,payments-api",
+        ])
+        assert r.returncode == 1
+        assert "empty entry" in r.stderr.lower()
+
+    def test_duplicate_entry_fails(self, tmp_path: Path) -> None:
+        r = _run_defender(tmp_path, [
+            "--acr-name", "myacr",
+            "--repositories", "app-backend,payments-api,app-backend",
+        ])
+        assert r.returncode == 1
+        assert "duplicate" in r.stderr.lower()
+        assert "app-backend" in r.stderr
+
+    def test_all_empty_fails(self, tmp_path: Path) -> None:
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
             "--repositories", ",,,",
         ])
-        # Downstream: with zero parsed entries the filter builder returns
-        # empty and we would inject an empty `| where ` — validation must
-        # catch this. Right now defender.sh checks $REPOSITORIES != "" so
-        # the argument-level check passes; the repo-loop finds nothing and
-        # exits 1 via "matched_any == 0".
         assert r.returncode == 1
 
 
 # ---------------------------------------------------------------------------
-# KQL injection — the filter snippet is present with the right OR chain
+# KQL injection — exact-match `in (...)` on Leg A + anchored contains on Leg B
 # ---------------------------------------------------------------------------
 
 class TestKqlFilterInjection:
-    def test_leg_a_uses_repositoryName_contains_or_chain(self, tmp_path: Path) -> None:
+    def test_leg_a_uses_in_list_literal(self, tmp_path: Path) -> None:
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
-            "--repositories", "app,payments",
+            "--repositories", "app-backend,payments-api",
         ], capture_query=True)
         assert r.returncode == 0, r.stderr
-
         kql = r.captured_query   # type: ignore[attr-defined]
-        # Leg A: on repositoryName. Both entries chained with `or`.
-        assert 'artifactDetails.repositoryName contains "app"' in kql
-        assert 'artifactDetails.repositoryName contains "payments"' in kql
-        # OR keyword must be present between them (not "and").
-        assert " or " in kql
+        # Leg A: exact match with `in (...)`. NOT `contains`.
+        assert 'artifactDetails.repositoryName in ("app-backend", "payments-api")' in kql
+        # Old contains-form must NOT appear on repositoryName.
+        assert 'artifactDetails.repositoryName contains' not in kql
 
-    def test_leg_b_uses_resourceDetails_id_dashed_paths(self, tmp_path: Path) -> None:
-        # Slash → dash conversion (see repo_to_dashed_path). Feed a slashed
-        # repo name so the dashing is exercised end-to-end.
+    def test_leg_b_uses_anchored_contains(self, tmp_path: Path) -> None:
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
-            "--repositories", "app,payments",
+            "--repositories", "app-backend,payments-api",
         ], capture_query=True)
         assert r.returncode == 0
-
         kql = r.captured_query   # type: ignore[attr-defined]
-        # Leg B: same substrings but on resourceDetails.Id.
-        assert 'resourceDetails.Id contains "app"' in kql
-        assert 'resourceDetails.Id contains "payments"' in kql
+        # Leg B: `contains "repositories-<dashed>-images-"` — the bracketing
+        # is what makes it exact match despite using `contains`.
+        assert 'resourceDetails.Id contains "repositories-app-backend-images-"' in kql
+        assert 'resourceDetails.Id contains "repositories-payments-api-images-"' in kql
+        # Un-anchored `contains "app-backend"` must NOT appear on Leg B
+        # (that would substring-match neighbors).
+        assert 'resourceDetails.Id contains "app-backend"' not in kql
+
+    def test_slashed_repo_is_dashed_on_leg_b(self, tmp_path: Path) -> None:
+        # Extend fixture repos to include a slashed one.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        az_body = """#!/usr/bin/env bash
+export CAPTURE_TO="%s"
+if [ "$1 $2" = "acr show" ]; then exit 0; fi
+if [ "$1 $2 $3" = "acr repository list" ]; then
+    printf 'team/app\\napp-backend\\n'
+    exit 0
+fi
+if [ "$1 $2" = "graph query" ]; then
+    qval=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -q) qval="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$qval" ] && printf '%%s\\n' "$qval" >> "$CAPTURE_TO"
+    echo '{"data":[],"skip_token":""}'
+    exit 0
+fi
+exit 0
+""" % (tmp_path / "captured_query.kql")
+        az_path = bin_dir / "az"
+        az_path.write_text(az_body, encoding="utf-8")
+        az_path.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        result = subprocess.run(
+            [str(DEFENDER), "--acr-name", "myacr", "--repositories", "team/app"],
+            cwd=tmp_path, env=env, capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        kql = (tmp_path / "captured_query.kql").read_text(encoding="utf-8")
+        # Leg A: exact `in ("team/app")` — slashes preserved as-is.
+        assert 'artifactDetails.repositoryName in ("team/app")' in kql
+        # Leg B: dashed anchor.
+        assert 'resourceDetails.Id contains "repositories-team-app-images-"' in kql
 
     def test_no_kql_injection_when_flag_absent(self, tmp_path: Path) -> None:
-        # Without --repositories nor --repository nor --scan-image, no
-        # `contains` clause should appear on repositoryName or dashed Id.
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
         ], capture_query=True)
         assert r.returncode == 0
         kql = r.captured_query   # type: ignore[attr-defined]
-        assert 'artifactDetails.repositoryName contains' not in kql
+        assert 'artifactDetails.repositoryName in (' not in kql
+        assert 'repositories-' not in kql.split("| union")[0]  # Leg A only

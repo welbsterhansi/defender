@@ -85,7 +85,8 @@ python3 report.py
 | `--image <ref>`       | Unblock a single `repo@sha256:...` |
 | `--list-blocked`      | Enumerates currently blocked manifests |
 | `--scan-image <ref>`  | Scan a specific repo, tag, or digest |
-| `--repositories <l>`  | Comma-separated list of repository substrings to scope the scan (mutually exclusive with `--repository` and `--scan-image`; each entry validated against `az acr repository list`) |
+| `--repository <r>`    | **Broad** substring filter (uses `contains`) — single repo. `app` will match `app-backend` and `myapp`. |
+| `--repositories <l>`  | **Controlled** exact list (comma-separated). Each entry must exist exactly in the ACR; empty entries or duplicates abort. `app` does NOT capture `app-backend`. Mutually exclusive with `--repository` and `--scan-image`. |
 | `--dry-run`           | Print commands without executing |
 | `--auto-approve`      | Skip interactive confirmation |
 | `--debug`             | Print the generated KQL and run a diagnostic ARG query |

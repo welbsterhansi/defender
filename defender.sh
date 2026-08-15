@@ -103,34 +103,79 @@ repo_to_dashed_path() {
 }
 
 # ---------------------------------------------------------------------------
-# Parse a comma-separated repository list into one-per-line output, trimmed
-# and de-duplicated (first occurrence wins). Empty entries are dropped.
-# Example: "  app , payments,, app , catalog " → "app\npayments\ncatalog"
-# Pure function — extracted to keep the caller readable and to make it
-# unit-testable via tests/test_defender_helpers.py.
+# Parse a comma-separated repository list into one-per-line output.
+# Strict semantics (task #38 — --repositories is a CONTROLLED list):
+#   - trim whitespace on each entry
+#   - empty entries (e.g. `app,,payments` or trailing comma) → exit 2
+#   - duplicate entries → exit 2
+# Errors go to stderr so the caller can surface them; stdout stays clean.
+# Example (ok):     "  app , payments , catalog " → "app\npayments\ncatalog"
+# Example (fail):   "app,,payments"               → exit 2, "empty entry" stderr
+# Example (fail):   "app,payments,app"            → exit 2, "duplicate: app" stderr
 # ---------------------------------------------------------------------------
 parse_repo_list() {
-    printf '%s' "$1" | tr ',' '\n' | awk '
-        {
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-            if ($0 != "" && !seen[$0]++) print
-        }
-    '
+    local raw="$1"
+    local -a items=()
+    local -A seen=()
+    local field trimmed
+    # Piping through `tr ','` preserves empty fields (including trailing ones)
+    # unlike a bash for-loop with IFS=',' which silently drops them.
+    while IFS= read -r field; do
+        trimmed="${field#"${field%%[![:space:]]*}"}"   # ltrim
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}" # rtrim
+        if [ -z "$trimmed" ]; then
+            echo "Error: --repositories has an empty entry (check for trailing commas or ',,')" >&2
+            return 2
+        fi
+        if [ -n "${seen[$trimmed]:-}" ]; then
+            echo "Error: --repositories has a duplicate entry: '$trimmed'" >&2
+            return 2
+        fi
+        seen[$trimmed]=1
+        items+=("$trimmed")
+    done < <(printf '%s\n' "$raw" | tr ',' '\n')
+    if [ "${#items[@]}" -eq 0 ]; then
+        echo "Error: --repositories is empty" >&2
+        return 2
+    fi
+    printf '%s\n' "${items[@]}"
 }
 
 # ---------------------------------------------------------------------------
-# Build a KQL "OR" expression over `contains` filters. Same pattern the
-# single-repo path uses; extended here for --repositories.
-# Example:
-#   build_repos_filter_expr "prop.name" app payments  →
-#     prop.name contains "app" or prop.name contains "payments"
-# Returns empty string when no repos are passed (caller decides).
+# Build a KQL exact-match list filter for Leg A.
+#   build_repos_in_expr "prop.name" app payments  →
+#     prop.name in ("app", "payments")
+# Returns empty string when no repos are passed.
 # ---------------------------------------------------------------------------
-build_repos_filter_expr() {
+build_repos_in_expr() {
     local prop="$1"; shift
-    local expr="" sep=""
+    [ "$#" -eq 0 ] && { printf ''; return 0; }
+    local expr="${prop} in (" sep=""
     for r in "$@"; do
-        expr+="${sep}${prop} contains \"${r}\""
+        expr+="${sep}\"${r}\""
+        sep=", "
+    done
+    expr+=")"
+    printf '%s' "$expr"
+}
+
+# ---------------------------------------------------------------------------
+# Build an anchored Leg B filter that emulates exact match against the
+# `repositories-<dashed>-images-` segment inside `resourceDetails.Id`.
+# The `repositories-…-images-` bracketing guarantees `app` does NOT capture
+# `app-backend` or `myapp` (the shorter substring cannot appear between
+# those anchors for a different repo).
+#   build_repos_id_anchor_expr "prop.Id" app team/service  →
+#     prop.Id contains "repositories-app-images-"
+#       or prop.Id contains "repositories-team-service-images-"
+# ---------------------------------------------------------------------------
+build_repos_id_anchor_expr() {
+    local prop="$1"; shift
+    [ "$#" -eq 0 ] && { printf ''; return 0; }
+    local expr="" sep="" dashed
+    for r in "$@"; do
+        dashed=$(repo_to_dashed_path "$r")
+        expr+="${sep}${prop} contains \"repositories-${dashed}-images-\""
         sep=" or "
     done
     printf '%s' "$expr"
@@ -195,8 +240,13 @@ usage() {
     echo "  --acr-name, -a       Name of the Azure Container Registry (Required)"
     echo "  --min-score          Minimum CVSS score to filter (Default: 9)"
     echo "  --max-score          Maximum CVSS score to filter (Default: 10)"
-    echo "  --repository, -r     Specific repository to filter (Optional)"
-    echo "  --repositories       Comma-separated list of repository substrings to filter (e.g., app,payments,catalog)"
+    echo "  --repository, -r     Broad substring filter — single repo, uses 'contains' (Optional)"
+    echo "                       e.g. --repository app  matches 'app', 'app-backend', 'myapp'"
+    echo "  --repositories       Controlled EXACT list of repositories (comma-separated)"
+    echo "                       e.g. --repositories app-backend,payments-api,catalog-svc"
+    echo "                       - each entry must exist exactly in the ACR (validated up front)"
+    echo "                       - empty (',,') or duplicate entries abort the run"
+    echo "                       - deterministic scope: 'app' does NOT capture 'app-backend'"
     echo "                       Mutually exclusive with --repository and --scan-image"
     echo "  --dry-run, -d        Print commands without executing"
     echo "  --block-images       BLOCK vulnerable images (default: report only)"
@@ -355,32 +405,32 @@ if [ -n "$REPOSITORY" ]; then
     fi
 fi
 
-# Validate --repositories list (if provided). Every filter substring must
-# match at least one real repository, otherwise the caller likely typoed
-# and the scan would silently miss that repo without warning.
+# Validate --repositories list (if provided). CONTROLLED list semantics:
+# each entry must exist EXACTLY in the ACR (no substring match). Empty or
+# duplicate entries are caught in parse_repo_list and abort the run before
+# we ever touch the query.
 if [ -n "$REPOSITORIES" ]; then
     echo "Validating repositories filter '$REPOSITORIES'..."
+    if ! _parsed=$(parse_repo_list "$REPOSITORIES"); then
+        exit 1  # parse_repo_list already printed the reason to stderr
+    fi
+
     ALL_REPOS=$(list_all_repositories "$ACR_NAME")
     missing=()
-    matched_any=0
     while IFS= read -r _r; do
-        [ -z "$_r" ] && continue
-        if echo "$ALL_REPOS" | grep -qi "$_r"; then
-            matched_any=1
-            _n=$(echo "$ALL_REPOS" | grep -ic "$_r" || true)
-            printf '  - %-40s (%d match(es))\n' "$_r" "$_n"
+        # `-Fx` = fixed string, whole line — no regex, no substring, no
+        # case folding. `app` will NOT match `myapp` or `app-backend`.
+        if printf '%s\n' "$ALL_REPOS" | grep -qFx "$_r"; then
+            printf '  - %s (exact match)\n' "$_r"
         else
             missing+=("$_r")
         fi
-    done < <(parse_repo_list "$REPOSITORIES")
+    done <<< "$_parsed"
 
     if [ "${#missing[@]}" -gt 0 ]; then
-        echo "Error: no repositories in '$ACR_NAME' match: ${missing[*]}" >&2
-        echo "       Fix the typos or drop the entries from --repositories." >&2
-        exit 1
-    fi
-    if [ "$matched_any" -eq 0 ]; then
-        echo "Error: --repositories filter matched zero repositories." >&2
+        echo "Error: repositories not found in '$ACR_NAME' (exact match): ${missing[*]}" >&2
+        echo "       Available repositories can be listed with:" >&2
+        echo "         az acr repository list --name $ACR_NAME --top 5000 --output tsv" >&2
         exit 1
     fi
 fi
@@ -691,21 +741,19 @@ elif [ -n "$REPOSITORY" ]; then
     _REPO_DASHED=$(repo_to_dashed_path "$REPOSITORY")
     EARLY_FILTER_B="| where properties.resourceDetails.Id contains \"$_REPO_DASHED\""
 elif [ -n "$REPOSITORIES" ]; then
-    # Same `contains` semantics as --repository, extended with OR across the
-    # parsed list. The KQL core is untouched — this only extends the injected
-    # filter snippet the single-repo path already used.
+    # CONTROLLED list semantics (task #38): exact match, not substring.
+    # Leg A uses KQL `in (...)`. Leg B uses `contains "repositories-<dashed>-images-"`
+    # — the `repositories-…-images-` bracketing is the exact-match anchor for
+    # the SoftwareUpdate `resourceDetails.Id` format, so `app` never captures
+    # `myapp` or `app-backend`.
     mapfile -t _repos_list < <(parse_repo_list "$REPOSITORIES")
-    _expr_a=$(build_repos_filter_expr \
+    _expr_a=$(build_repos_in_expr \
         "properties.additionalData.artifactDetails.repositoryName" \
         "${_repos_list[@]}")
     EARLY_FILTER_A="| where $_expr_a"
-    _dashed_list=()
-    for _r in "${_repos_list[@]}"; do
-        _dashed_list+=("$(repo_to_dashed_path "$_r")")
-    done
-    _expr_b=$(build_repos_filter_expr \
+    _expr_b=$(build_repos_id_anchor_expr \
         "properties.resourceDetails.Id" \
-        "${_dashed_list[@]}")
+        "${_repos_list[@]}")
     EARLY_FILTER_B="| where $_expr_b"
 fi
 
