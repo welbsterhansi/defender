@@ -52,8 +52,12 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/az" <<AZEOF
 #!/usr/bin/env bash
-# Log every invocation for post-run analysis.
-echo "\$*" >> "$WORK/az_calls.log"
+# Log every invocation as ONE line so counts via wc -l stay accurate.
+# `az graph query -q "\$KQL"` receives a multi-line KQL string; \$*
+# expansion would emit those newlines into the log and inflate the count.
+# Parameter expansion replaces LF with the escape "\\n".
+_call="\${*//\$'\\n'/\\\\n}"
+printf '%s\\n' "\$_call" >> "$WORK/az_calls.log"
 
 # Artificial latency to model network cost.
 if [ "$LATENCY_MS" -gt 0 ]; then

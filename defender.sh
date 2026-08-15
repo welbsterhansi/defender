@@ -70,16 +70,22 @@ classify_severity() {
 
 # ---------------------------------------------------------------------------
 # Elapsed-time helper for per-page instrumentation (task #42, PR-0).
-# Uses bash 5's $EPOCHREALTIME (seconds.microseconds). On bash 4 the value
-# is empty and we return "0" — the log line still emits, ops just see 0ms
-# and know the env doesn't support timing.
+# Preferred source: bash 5's $EPOCHREALTIME (seconds.microseconds).
+# Fallback: `date +%s.%N` from GNU coreutils (Linux/WSL — the client's
+# runtime — is guaranteed to have it). BSD `date` (macOS default) returns
+# a literal `%N`; we detect and degrade to 0 so ms fields stay parseable.
 # ---------------------------------------------------------------------------
 _now_realtime() {
     if [ -n "${EPOCHREALTIME:-}" ]; then
         printf '%s' "$EPOCHREALTIME"
-    else
-        printf '0'
+        return
     fi
+    local ts
+    ts=$(date +%s.%N 2>/dev/null || echo "0")
+    case "$ts" in
+        *%N|""|0) printf '0' ;;   # BSD date or no date
+        *)        printf '%s' "$ts" ;;
+    esac
 }
 _elapsed_ms() {
     local start="${1:-0}"

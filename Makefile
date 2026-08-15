@@ -28,8 +28,9 @@ lint:
 	@echo "==> bash -n"
 	@bash -n defender.sh
 	@bash -n check_ocp.sh
+	@bash -n scripts/benchmark-defender.sh
 	@echo "==> shellcheck (warning+ severity; info/style are advisory)"
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck --severity=warning defender.sh check_ocp.sh lib/logging.sh; else echo "(shellcheck not installed, skipping)"; fi
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck --severity=warning defender.sh check_ocp.sh lib/logging.sh scripts/benchmark-defender.sh; else echo "(shellcheck not installed, skipping)"; fi
 
 check: test lint
 
