@@ -109,6 +109,30 @@ def test_e2e_full_pipeline(
     assert "Vulnerable Images" in html, "new dev-facing section title missing"
     assert "Runs in:" in html, "workload attribution row missing"
 
+    # ---- Task #35: no client branding leaks into the HTML -----------------
+    # Client name must never appear in the generated report — it belongs to
+    # gitignored local docs only. Regex-catch common casings.
+    import re as _re
+    assert not _re.search(r"novo\s*banco", html, _re.IGNORECASE), \
+        "client name leaked into HTML output"
+
+    # ---- Task #34: full image reference `repo:tag@digest` + copy button ---
+    # Devs remediate by tag, so the header must expose the full pinnable
+    # reference and let the operator copy it in one click.
+    repo, tag, digest = "myapp/backend", "v1.2", "sha256:aaa111"
+    full_ref = f"{repo}:{tag}@{digest}"
+    assert repo in html, "repository missing from header"
+    assert f":{tag}" in html, "tag missing from header (should be visually prominent)"
+    assert digest in html, "digest missing from header"
+    assert full_ref in html, (
+        f"full reference '{full_ref}' should appear as one copyable string"
+    )
+    # Copy button for the reference must exist with the payload as data-copy.
+    assert 'class="copy-btn copy-btn-ref"' in html, "image reference copy button missing"
+    assert f'data-copy="{full_ref}"' in html, "copy button payload must be repo:tag@digest"
+    # Tag is styled as a chip (destaque visual pedido pelo gestor)
+    assert 'class="img-tag"' in html, "tag chip class missing (visual highlight)"
+
     # ---- Task #16: Weaponized KPI -----------------------------------------
     # KPI counts CVE entries that have any exploit signal.
     # Fixture: CVE-2024-0001 has hasVerifiedExploit=true → weaponized ≥ 1

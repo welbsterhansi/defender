@@ -220,6 +220,12 @@ def load_data(summary_path: str | os.PathLike | None = None,
     return ns
 
 def build_html(namespaces):
+    """Render the vulnerability report as a single self-contained HTML string.
+
+    Design (task #35 redesign): editorial data-driven aesthetic. Every pixel
+    earns its place — devs land, filter, find their image, copy the fix. No
+    synthetic scores, no marketing tone, no client branding.
+    """
     now = datetime.now().strftime("%d %b %Y, %H:%M")
 
     all_w    = [(ns, k, w) for ns, ws in namespaces.items() for k, w in ws.items()]
@@ -232,230 +238,120 @@ def build_html(namespaces):
             cve_agg[c["id"]]["max"]    = max(cve_agg[c["id"]]["max"], c["score"])
             cve_agg[c["id"]]["workloads"].append((ns_name, w["name"], w["type"], w["repo"]))
 
-    top_cves     = sorted(cve_agg.items(), key=lambda x: (-x[1]["max"], -x[1]["count"]))[:12]
-    score10      = [(ns, w) for ns, _, w in all_w if w["max_score"] == 10.0]
-    top_workloads= sorted(all_w, key=lambda x: -x[2]["max_score"])[:5]
+    top_cves    = sorted(cve_agg.items(), key=lambda x: (-x[1]["max"], -x[1]["count"]))[:12]
+    score10     = [(ns, w) for ns, _, w in all_w if w["max_score"] == 10.0]
+    images_view = build_image_view(namespaces)
 
-    total_ns       = len(namespaces)
-    total_w        = len(all_w)
-    total_e        = len(all_cves)
-    unique_cves    = len(cve_agg)
-    s10_count      = len(score10)
+    total_images = len(images_view)
+    total_w      = len(all_w)
+    total_e      = len(all_cves)
+    unique_cves  = len(cve_agg)
+    s10_count    = len(score10)
     # Weaponized = any CVE entry with a known exploit (verified > published > kit).
-    # Counted at the entry level (one workload × one CVE) so operators see the
-    # concrete exposure, not just the unique CVE count.
-    weap_count     = sum(1 for c in all_cves if _is_weaponized(c))
+    weap_count   = sum(1 for c in all_cves if _is_weaponized(c))
 
-    # ── Cluster Health Score (0–100) ─────────────────────────────────────────
-    # Four weighted components, each scored 0–100 (higher = healthier):
-    #
-    #  A. Severity     (40%) — average CVSS of all entries, penalised non-linearly
-    #  B. Blast radius (25%) — fraction of workloads carrying at least one CVE ≥9.0
-    #  C. CVE density  (20%) — critical CVEs (≥9.8) per workload
-    #  D. Exposure     (15%) — critical service namespaces affected (SSO, ingress…)
-    #
-    # Extra penalty applied after weighting:
-    #  • Each CVE ≥9.8 affecting >20 workloads → −2 pts (max −10)
-    #  • Each CVSS-10.0 workload beyond the first → −1 pt  (max −5)
-
-    CRITICAL_NS_KW = ["sso", "rhsso", "keycloak", "auth", "ingress", "gateway",
-                      "cert-manager", "vault", "iam", "ldap"]
-
-    cvss_vals   = [c["score"] for c in all_cves] or [0]
-    avg_cvss    = sum(cvss_vals) / len(cvss_vals)
-    # A — severity: avg CVSS 9.5+ → ~0; 7.0 → ~50; 5.0 → ~100
-    comp_sev    = max(0.0, min(100.0, (10.0 - avg_cvss) / 5.0 * 100))
-
-    # B — blast radius: % of workloads with any CVE
-    affected_wl = len(set((ns, w["name"]) for ns, _, w in all_w if w["cves"]))
-    comp_blast  = max(0.0, 100.0 - (affected_wl / max(total_w, 1)) * 100)
-
-    # C — CVE density: critical CVEs (≥9.8) per workload; 5+ per wl → 0
-    crit_entries = sum(1 for c in all_cves if c["score"] >= 9.8)
-    crit_density = crit_entries / max(total_w, 1)
-    comp_density = max(0.0, 100.0 - crit_density * 20)
-
-    # D — critical namespace exposure: −25 pts per critical NS affected
-    hit_ns = [ns for ns in namespaces if any(k in ns.lower() for k in CRITICAL_NS_KW)]
-    comp_exposure = max(0.0, 100.0 - len(hit_ns) * 25)
-
-    raw_health = (comp_sev * 0.40 + comp_blast * 0.25 +
-                  comp_density * 0.20 + comp_exposure * 0.15)
-
-    # Extra penalties
-    extra_pen = 0
-    for _, d in cve_agg.items():
-        if d["max"] >= 9.8 and d["count"] > 20:
-            extra_pen += 2
-    extra_pen = min(extra_pen, 10)
-    extra_pen += min(max(s10_count - 1, 0), 5)
-
-    health_score_raw = max(0, round(raw_health - extra_pen))
-    # Floor at 5 so we never show a hard "0" — still signals critical
-    health_score = max(5, health_score_raw)
-
-    # Risk drivers (top 3 worst components only — no penalty row)
-    risk_drivers = []
-    driver_meta = {
-        "Severity":     (comp_sev,      f"Avg CVSS {avg_cvss:.1f}"),
-        "Blast Radius": (comp_blast,    f"{affected_wl}/{total_w} workloads affected"),
-        "CVE Density":  (comp_density,  f"{crit_entries} critical CVE entries"),
-        "Exposure":     (comp_exposure, f"{len(hit_ns)} critical service{'s' if len(hit_ns)!=1 else ''} exposed"),
-    }
-    for name, (val, detail) in sorted(driver_meta.items(), key=lambda x: x[1][0])[:3]:
-        risk_drivers.append((name, round(val), detail))
-
-    # 1-line insight: pick the single worst driver
-    worst_driver = risk_drivers[0][0] if risk_drivers else "Severity"
-    insight_map = {
-        "Severity":     f"Average CVSS of {avg_cvss:.1f} across all entries indicates near-maximum exploitability.",
-        "Blast Radius": f"All {affected_wl} workloads carry active CVEs — full cluster exposure with no clean baseline.",
-        "CVE Density":  f"{crit_entries} critical CVE entries across {total_w} workloads require immediate image rebuilds.",
-        "Exposure":     f"Critical services ({', '.join(hit_ns[:2])}) are affected, raising the risk of cascading impact.",
-    }
-    health_insight = insight_map.get(worst_driver, "")
-
-    if health_score <= 40:
-        health_color, health_label = "#DC2626", "Critical"
-    elif health_score <= 70:
-        health_color, health_label = "#F97316", "At Risk"
-    else:
-        health_color, health_label = "#059669", "Healthy"
-
-    def ns_max(ns): return max(w["max_score"] for w in namespaces[ns].values())
-
-    # Critical alert
-    alert_items = "".join(
-        f'<div class="al-item">'
-        f'<span class="al-ns">{ns_name}</span><span class="al-sep">/</span>'
-        f'<span class="al-name">{w["name"]}</span>'
-        f'{wbadge(w["type"])}{badge(w["max_score"])}'
+    # ── Alert bar ── only when there's something that demands action NOW.
+    # This is the single "you cannot ignore this" element; kept sticky in CSS.
+    alert_parts = []
+    if s10_count > 0:
+        alert_parts.append(f"{s10_count} workload{'s' if s10_count!=1 else ''} at CVSS 10.0")
+    if weap_count > 0:
+        alert_parts.append(f"{weap_count} weaponized CVE entr{'ies' if weap_count!=1 else 'y'}")
+    alert_html = (
+        f'<div class="alert-bar" role="alert">'
+        f'<strong>Immediate action:</strong> {" · ".join(alert_parts)}'
         f'</div>'
-        for ns_name, w in sorted(score10, key=lambda x: x[0])
+        if alert_parts else ""
     )
-    alert_html = f'''
-    <div class="crit-alert">
-      <div class="crit-hdr">{ic("alert",18,"#991B1B")} CVSS 10.0 — Maximum Severity — Immediate Action Required</div>
-      <div class="al-grid">{alert_items}</div>
-    </div>''' if score10 else ""
 
-    # Top CVEs accordion
-    max_count = max(d["count"] for _, d in top_cves) if top_cves else 1
-    cve_accordion = ""
-    for i, (cve_id, d) in enumerate(top_cves):
-        bar = int(d["count"] / max_count * 100)
-        wl_rows = "".join(
-            f'<tr>'
-            f'<td><span class="ns-tag">{ns_name}</span></td>'
-            f'<td><span class="wl-name" style="font-size:.85em">{wname}</span> {wbadge(wtype)}</td>'
-            f'<td class="mono" style="font-size:.8em;color:#64748B">{repo}</td>'
-            f'</tr>'
-            for ns_name, wname, wtype, repo in sorted(d["workloads"], key=lambda x: x[0])
-        )
-        cve_accordion += f'''
-        <div class="ns-card">
-          <button class="ns-btn" onclick="toggle(this)">
-            <div class="ns-left">
-              <span class="rank" style="font-size:.9em">{i+1:02d}</span>
-              <span class="mono" style="font-size:.92em;color:#1E293B;font-weight:600">{cve_id}</span>
-              {badge(d["max"])}
-            </div>
-            <div class="ns-right">
-              <div class="barw" style="width:140px">
-                <div class="barf" style="width:{bar}%"></div>
-                <span class="barl">{d["count"]} workload{"s" if d["count"]>1 else ""}</span>
-              </div>
-              <span class="chev">{ic("chevron",15,"#94A3B8")}</span>
-            </div>
-          </button>
-          <div class="ns-body">
-            <table class="cve-tbl" style="margin-top:8px">
-              <thead><tr><th>Namespace</th><th>Workload</th><th>Image</th></tr></thead>
-              <tbody>{wl_rows}</tbody>
-            </table>
-          </div>
-        </div>'''
-
-    # Namespace accordion
-    # ── Vulnerable Images view — one card per repo:tag@digest ──────────────
-    # Renders BEFORE the Namespace view so devs land on the layer they need
-    # to fix. Same collapsible pattern, so no extra JS.
+    # ── Vulnerable Images cards ── primary dev-facing view, top-3 open ──
     image_cards = ""
-    for img in build_image_view(namespaces):
-        digest_short = img["digest"][:24] + "..." if len(img["digest"]) > 24 else img["digest"]
-        tag_html = (
-            f'<span style="font-size:.85em;color:#0EA5E9;font-weight:600">:{img["tag"]}</span>'
-            if img.get("tag") and img["tag"] not in ("N/A", "") else ""
+    for i, img in enumerate(images_view):
+        repo    = img["repo"]
+        tag     = img.get("tag", "") or ""
+        digest  = img["digest"]
+        tag_present = tag not in ("N/A", "")
+        full_ref = f"{repo}:{tag}@{digest}" if tag_present else f"{repo}@{digest}"
+        full_ref_attr = html.escape(full_ref, quote=True)
+        digest_short = digest[:24] + "..." if len(digest) > 24 else digest
+        tag_html_span = (
+            f'<span class="img-tag" title="tag: {html.escape(tag, quote=True)}">'
+            f':{html.escape(tag)}</span>'
+            if tag_present else
+            '<span class="img-tag img-tag-missing" title="tag not recorded by scanner">:(no tag)</span>'
         )
         cve_count = len(img["cves"])
         weap = img["weaponized_count"]
-        weap_pill = (
-            f'<span class="pill pill-red">{weap} weaponized</span>' if weap > 0 else ""
-        )
+        weap_pill = f'<span class="pill pill-red">{weap} weaponized</span>' if weap > 0 else ""
         runs_in = " ".join(
-            f'<span class="run-chip"><span class="ns-tag">{ns_name}</span> / '
-            f'<span style="font-weight:600">{wname}</span> {wbadge(wtype)}</span>'
+            f'<span class="run-chip"><span class="ns-tag">{html.escape(ns_name)}</span> / '
+            f'<span style="font-weight:600">{html.escape(wname)}</span> {wbadge(wtype)}</span>'
             for ns_name, wname, wtype in sorted(img["workloads"])
         )
-        cve_rows = "".join(
-            _cve_row(c) for c in sorted(img["cves"], key=lambda x: -x["score"])
-        )
-        # data-search: everything the free-text filter should match on
-        search_terms = " ".join([img["repo"], img.get("tag", "") or ""] +
+        cve_rows = "".join(_cve_row(c) for c in sorted(img["cves"], key=lambda x: -x["score"]))
+        search_terms = " ".join([repo, tag] +
                                 [ns for ns, _, _ in img["workloads"]] +
                                 [wname for _, wname, _ in img["workloads"]])
+        # Top 3 expanded by default — dev sees the worst without clicking.
+        body_style = ' style="display:block"' if i < 3 else ''
+        chev_style = ' style="transform:rotate(180deg)"' if i < 3 else ''
         image_cards += f'''
-        <div class="ns-card" data-search="{html.escape(search_terms.lower(), quote=True)}">
-          <button class="ns-btn" onclick="toggle(this)">
-            <div class="ns-left">
-              <span class="mono" style="font-weight:600;color:#0F172A">{img["repo"]}</span>
-              {tag_html}
-              <span class="digest-t">@ {digest_short}</span>
+        <div class="card" data-search="{html.escape(search_terms.lower(), quote=True)}">
+          <button class="card-btn" onclick="toggle(this)">
+            <div class="card-left">
+              <span class="img-ref mono">
+                <span class="img-repo">{html.escape(repo)}</span>{tag_html_span}<span class="img-digest">@{digest_short}</span>
+              </span>
+              <button class="copy-btn copy-btn-ref" data-copy="{full_ref_attr}" onclick="cpy(this)" title="Copy {full_ref_attr}">⧉</button>
             </div>
-            <div class="ns-right">
+            <div class="card-right">
               {badge(img["max_score"])}
               <span class="pill">{cve_count} CVE{"s" if cve_count != 1 else ""}</span>
               {weap_pill}
-              <span class="chev">{ic("chevron",15,"#94A3B8")}</span>
+              <span class="chev"{chev_style}>{ic("chevron",15,"#94A3B8")}</span>
             </div>
           </button>
-          <div class="ns-body">
+          <div class="card-body"{body_style}>
             <div class="runs-in"><strong>Runs in:</strong> {runs_in}</div>
-            <table class="cve-tbl" style="margin-top:8px">
+            <table class="cve-tbl">
               <thead><tr><th>CVE ID</th><th>Severity</th><th>Score</th><th>Package</th><th>Current → Fixed</th><th>Patch</th><th>Exploit</th></tr></thead>
               <tbody>{cve_rows}</tbody>
             </table>
           </div>
         </div>'''
 
+    # ── Namespace Detail ── SRE view, all collapsed ─────────────────────
+    def _ns_total_cves(ns): return sum(w["cve_count"] for w in namespaces[ns].values())
+    def _ns_max(ns):
+        vals = [w["max_score"] for w in namespaces[ns].values()]
+        return max(vals) if vals else 0.0
+
     ns_html = ""
-    def ns_total_cves(ns): return sum(w["cve_count"] for w in namespaces[ns].values())
-    for ns_name in sorted(namespaces.keys(), key=lambda x: -ns_total_cves(x)):
-        ws       = namespaces[ns_name]
-        ns_score = ns_max(ns_name)
+    for ns_name in sorted(namespaces.keys(), key=lambda x: -_ns_total_cves(x)):
+        ws = namespaces[ns_name]
+        ns_score = _ns_max(ns_name)
         total_ns_cves = sum(w["cve_count"] for w in ws.values())
 
-        cards = ""
+        wl_cards = ""
         for (wtype, wname), w in sorted(ws.items(), key=lambda x: -x[1]["max_score"]):
             digest_s = w["digest"][:24] + "..."
-            cve_trs = "".join(
-                _cve_row(c) for c in sorted(w["cves"], key=lambda x: -x["score"])
+            cve_trs = "".join(_cve_row(c) for c in sorted(w["cves"], key=lambda x: -x["score"]))
+            tag_span = (
+                f'<span class="img-tag">:{html.escape(w["tag"])}</span>'
+                if w.get("tag") and w["tag"] not in ("N/A", "") else ""
             )
-            cards += f'''
+            wl_cards += f'''
             <div class="wl-card">
               <div class="wl-hdr">
                 <div class="wl-left">
-                  <span class="wl-name">{wname}</span>
+                  <span class="wl-name">{html.escape(wname)}</span>
                   {wbadge(wtype)}
                   <span class="wl-cpill">{w["cve_count"]} CVE{"s" if w["cve_count"]>1 else ""}</span>
                 </div>
                 {badge(w["max_score"])}
               </div>
               <div class="wl-img">
-                {ic("namespace",13,"#94A3B8")}
-                <span class="mono">{w["repo"]}</span>
-                {f'<span style="font-size:.8em;color:#0EA5E9;font-weight:600">:{w["tag"]}</span>' if w.get("tag") and w["tag"] not in ("N/A","") else ""}
-                <span class="digest-t">@ {digest_s}</span>
+                <span class="mono img-repo">{html.escape(w["repo"])}</span>{tag_span}<span class="digest-t">@{digest_s}</span>
               </div>
               <table class="cve-tbl">
                 <thead><tr><th>CVE ID</th><th>Severity</th><th>Score</th><th>Package</th><th>Current → Fixed</th><th>Patch</th><th>Exploit</th></tr></thead>
@@ -466,256 +362,145 @@ def build_html(namespaces):
         ns_search = " ".join([ns_name] + [w["repo"] for w in ws.values()] +
                              [w["name"] for w in ws.values()])
         ns_html += f'''
-        <div class="ns-card" data-search="{html.escape(ns_search.lower(), quote=True)}">
-          <button class="ns-btn" onclick="toggle(this)">
-            <div class="ns-left">
-              {ic("namespace",15,"#64748B")}
-              <span class="ns-name">{ns_name}</span>
+        <div class="card" data-search="{html.escape(ns_search.lower(), quote=True)}">
+          <button class="card-btn" onclick="toggle(this)">
+            <div class="card-left">
+              <span class="ns-name">{html.escape(ns_name)}</span>
               <span class="pill">{len(ws)} workload{"s" if len(ws)>1 else ""}</span>
               <span class="pill pill-y">{total_ns_cves} CVEs</span>
             </div>
-            <div class="ns-right">
+            <div class="card-right">
               {badge(ns_score)}
               <span class="chev">{ic("chevron",15,"#94A3B8")}</span>
             </div>
           </button>
-          <div class="ns-body">{cards}</div>
+          <div class="card-body">{wl_cards}</div>
         </div>'''
 
-    # Analysis
-    top3_wl = "".join(
-        f'<li><strong>{ns_name}/{w["name"]}</strong> ({w["type"]}) &mdash; '
-        f'<code>{w["repo"]}</code> &mdash; {w["cve_count"]} CVE(s), max CVSS {w["max_score"]}. '
-        f'<em>Rebuild from latest patched base image and redeploy immediately.</em></li>'
-        for ns_name, _, w in top_workloads
-    )
-    top3_cves = "".join(
-        f'<li><code>{cve}</code> &mdash; CVSS {d["max"]} &mdash; '
-        f'affects <strong>{d["count"]}</strong> workload(s). '
-        f'Widespread base image contamination &mdash; rebuild all images using this layer.</li>'
-        for cve, d in top_cves[:5]
-    )
-    imm_targets = "".join(
-        f'<li><strong>{ns_name}/{w["name"]}</strong> &mdash; <code>{w["repo"]}</code> &mdash; '
-        f'Rebuild and redeploy within 24h. Isolate with NetworkPolicy until patched.</li>'
-        for ns_name, w in sorted(score10, key=lambda x: (x[0], x[1]["name"]))
-    ) or "<li><em>No workload currently at CVSS 10.0.</em></li>"
+    # ── Most Widespread CVEs ── reference table, tertiary ────────────────
+    widespread_html = ""
+    if top_cves:
+        max_count = max(d["count"] for _, d in top_cves)
+        cve_rows_html = "".join(
+            f'<tr>'
+            f'<td class="mono">{html.escape(cve_id)}</td>'
+            f'<td>{badge(d["max"])}</td>'
+            f'<td class="w-bar">'
+            f'<div class="bar-wrap">'
+            f'<div class="bar-fill" style="width:{int(d["count"] / max_count * 100)}%"></div>'
+            f'<span class="bar-label">{d["count"]}</span>'
+            f'</div>'
+            f'</td>'
+            f'</tr>'
+            for cve_id, d in top_cves
+        )
+        widespread_html = f'''
+        <div class="tbl-wrap">
+          <table class="tbl-widespread">
+            <thead><tr><th>CVE ID</th><th>Max Score</th><th>Workloads affected</th></tr></thead>
+            <tbody>{cve_rows_html}</tbody>
+          </table>
+        </div>'''
 
-    # ── Derived helpers for "Attack Vectors" and "Next Actions" ────────────
-    # Prior versions hard-coded namespace names (prd-fad, prd-airflow, ...).
-    # Now we derive them so the analysis stays truthful for any input.
-    score10_ns = sorted({ns for ns, _ in score10})  # namespaces with a CVSS-10
-    top_ns_by_wl = sorted(
-        ((ns, len(ws)) for ns, ws in namespaces.items()),
-        key=lambda x: -x[1],
-    )[:3]
-    top_freq_cves = [cve for cve, _ in top_cves[:3]]
-
-    def _fmt_ns_list(ns_list: list[str], sep: str = " or ") -> str:
-        codes = [f"<code>{html.escape(n)}</code>" for n in ns_list[:3]]
-        return sep.join(codes) if codes else "<em>none</em>"
-
-    lateral_html = (
-        f"Compromised pods in {_fmt_ns_list(score10_ns)} share the cluster SDN, "
-        "enabling pivoting across namespaces."
-        if score10_ns else
-        "No CVSS 10.0 workloads detected in the current scan &mdash; lateral "
-        "movement risk is limited to the top-severity images listed above."
-    )
-    # Identity provider bullet: only surface if a known identity-adjacent NS is affected.
-    id_kws = ("sso", "rhsso", "keycloak", "auth", "iam", "ldap")
-    id_ns_hits = [ns for ns in score10_ns if any(k in ns.lower() for k in id_kws)]
-    identity_html = (
-        f"{_fmt_ns_list(id_ns_hits, sep=', ')} exposes identity/SSO surfaces at "
-        "CVSS 10.0. Compromise grants access to all dependent services."
-        if id_ns_hits else
-        "No identity/SSO namespaces at CVSS 10.0 &mdash; keep monitoring for regression."
-    )
-    imm_workloads_html = _fmt_ns_list(
-        [f"{ns}/{w['name']}" for ns, w in score10[:4]], sep=", "
-    ) if score10 else "<em>none pending immediately</em>"
-    top_ns_html = ", ".join(
-        f"<code>{html.escape(n)}</code> ({c})" for n, c in top_ns_by_wl
-    ) if top_ns_by_wl else "<em>none</em>"
-    top_freq_cves_html = ", ".join(
-        f"<code>{html.escape(c)}</code>" for c in top_freq_cves
-    ) if top_freq_cves else "<em>none</em>"
-
-    analysis = f'''
-    <div class="analysis">
-      <div class="a-hdr">
-        {ic("shield",22,"#059669")}
-        <div><h2>Security Analysis &amp; Recommendations</h2>
-        <p>Executive summary for platform and development teams &mdash; {now}</p></div>
-      </div>
-      <div class="a-grid">
-        <div class="a-card a-red">
-          <div class="a-title">{ic("zap",15,"#991B1B")} Immediate Action Required (CVSS 10.0)</div>
-          <ul class="a-list">{imm_targets}</ul>
-        </div>
-        <div class="a-card">
-          <div class="a-title">{ic("target",15,"#D97706")} Most Critical Workloads</div>
-          <ul class="a-list">{top3_wl}</ul>
-        </div>
-        <div class="a-card">
-          <div class="a-title">{ic("activity",15,"#7C3AED")} Highest-Risk CVEs by Exposure</div>
-          <ul class="a-list">{top3_cves}</ul>
-        </div>
-        <div class="a-card">
-          <div class="a-title">{ic("network",15,"#DC2626")} OpenShift-Specific Attack Vectors</div>
-          <ul class="a-list">
-            <li><strong>RCE via heap overflow</strong> &mdash; expat/libxml2 CVEs allow remote code execution. In OpenShift, this can escalate to host access if the pod runs as root.</li>
-            <li><strong>Privilege escalation</strong> &mdash; CVE-2024-1597 (pgjdbc, CVSS 10.0) allows unauthenticated SQL injection that can execute OS commands via the service account.</li>
-            <li><strong>Lateral movement</strong> &mdash; {lateral_html}</li>
-            <li><strong>Identity provider compromise</strong> &mdash; {identity_html}</li>
-            <li><strong>Supply chain risk</strong> &mdash; {unique_cves} unique CVEs across {total_w} workloads indicate widespread base image contamination.</li>
-          </ul>
-        </div>
-        <div class="a-card a-green" style="grid-column:1/-1">
-          <div class="a-title">{ic("patch",15,"#065F46")} Recommended Next Actions</div>
-          <ol class="a-list">
-            <li><strong>24h:</strong> Isolate and rebuild CVSS 10.0 workloads &mdash; {imm_workloads_html}.</li>
-            <li><strong>48-72h:</strong> Rebuild images affected by top-frequency CVEs ({top_freq_cves_html}). Updating the shared base layer resolves them across all dependents.</li>
-            <li><strong>1 week:</strong> Address namespaces with most workloads: {top_ns_html}.</li>
-            <li><strong>Ongoing:</strong> Enable Defender for Cloud registry scan on push. Block images with CVSS &ge; 9 via admission webhook before deploying to production.</li>
-            <li><strong>Validation:</strong> After each rebuild, re-run <code>defender.sh</code> and <code>generate_report.py</code> to confirm CVEs are resolved.</li>
-          </ol>
-        </div>
-      </div>
-    </div>'''
+    weap_cls = "kpi-num critical" if weap_count > 0 else "kpi-num"
+    s10_cls  = "kpi-num critical" if s10_count > 0 else "kpi-num"
 
     css = """
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:'Inter','Segoe UI',system-ui,sans-serif;background:#F1F5F9;color:#1E293B;font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
-    code{background:#E2E8F0;color:#1E293B;padding:1px 5px;border-radius:4px;font-size:.88em;font-family:'Courier New',monospace}
-    .mono{font-family:'Courier New',monospace;font-size:.85em}
-    .topbar{background:#fff;border-bottom:1px solid #E2E8F0;padding:0 40px;height:58px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:200;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+    :root{
+      --bg:#FAFAF9; --surface:#FFFFFF; --border:#E7E5E4; --border-strong:#D6D3D1;
+      --text:#1C1917; --text-2:#57534E; --text-3:#A8A29E; --accent:#059669;
+      --critical:#DC2626; --high:#EA580C; --medium:#CA8A04; --low:#16A34A;
+      --alert-bg:#FEE2E2; --alert-border:#FCA5A5; --alert-text:#7F1D1D;
+    }
+    body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.55;font-feature-settings:'cv11','ss01','ss03';-webkit-font-smoothing:antialiased}
+    code,.mono{font-family:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Monaco,'Cascadia Mono',monospace;font-size:.88em}
+    .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 32px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:200}
     .brand{display:flex;align-items:center;gap:10px}
-    .brand-dot{width:9px;height:9px;border-radius:50%;background:#059669;box-shadow:0 0 0 3px rgba(5,150,105,.18)}
-    .brand-t{font-weight:700;font-size:.92em;color:#0F172A}
-    .brand-s{color:#94A3B8;font-weight:400;font-size:.85em;margin-left:4px}
-    .topbar-date{font-size:.78em;color:#94A3B8}
-    .hero{background:linear-gradient(135deg,#0C3B2E 0%,#0A5C3C 55%,#059669 100%);padding:48px 40px 44px;color:#fff}
-    .hero h1{font-size:1.6em;font-weight:300;letter-spacing:.3px}
-    .hero h1 strong{font-weight:700}
-    .hero p{opacity:.55;font-size:.83em;margin-top:8px;letter-spacing:.2px}
-    .health-wrap{margin-top:32px;max-width:520px}
-    .health-meta{display:flex;align-items:baseline;gap:12px;margin-bottom:10px}
-    .health-lbl{font-size:.72em;text-transform:uppercase;letter-spacing:.9px;color:rgba(255,255,255,.5);font-weight:600}
-    .health-score{font-size:2em;font-weight:800;line-height:1}
-    .health-total{font-size:.45em;color:rgba(255,255,255,.4);font-weight:400;margin-left:2px}
-    .health-tag{font-size:.68em;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-radius:20px;padding:3px 12px}
-    .health-track{position:relative;height:10px;border-radius:99px;overflow:visible;margin-bottom:12px}
-    .health-gradient-bar{position:absolute;inset:0;border-radius:99px;background:linear-gradient(to right,#DC2626 0%,#F97316 35%,#EAB308 60%,#22C55E 100%);opacity:.85}
-    .health-marker{position:absolute;top:50%;transform:translateY(-50%);width:12px;height:12px;border-radius:50%;background:#fff;border:2px solid rgba(255,255,255,.9);box-shadow:0 0 0 3px rgba(0,0,0,.25);z-index:2}
-    .health-fill{height:100%;border-radius:99px;transition:width .6s ease}
-    .health-insight{font-size:.78em;color:rgba(255,255,255,.55);line-height:1.5;margin-top:0;font-style:italic}
-    .drivers-section{background:#FAFBFC;border:1px solid #EEF2F7;border-radius:12px;padding:16px 20px;margin-bottom:22px;box-shadow:none}
-    .drivers-header{display:flex;align-items:center;gap:7px;margin-bottom:13px}
-    .drivers-title{font-size:.68em;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:#94A3B8}
-    .drivers-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
-    .driver-card{background:#fff;border:1px solid #F1F5F9;border-radius:9px;padding:12px 15px}
-    .driver-card-name{font-size:.65em;text-transform:uppercase;letter-spacing:.5px;color:#CBD5E1;font-weight:600;margin-bottom:4px}
-    .driver-card-val{font-size:.92em;font-weight:700;color:#475569;line-height:1.3}
-    .container{max-width:1080px;margin:0 auto;padding:28px 20px 60px}
-    .kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:13px;margin-bottom:26px}
-    @media(max-width:1000px){.kpis{grid-template-columns:repeat(3,1fr)}}
-    @media(max-width:600px){.kpis{grid-template-columns:repeat(2,1fr)}}
-    .kpi{background:#fff;border-radius:12px;padding:18px 14px;text-align:center;border:1px solid #E2E8F0;box-shadow:0 1px 4px rgba(0,0,0,.05);transition:box-shadow .18s}
-    .kpi:hover{box-shadow:0 4px 14px rgba(0,0,0,.09)}
-    .kpi svg{opacity:.4;margin-bottom:8px}
-    .kpi-n{font-size:2em;font-weight:800;color:#0F172A;line-height:1}
-    .kpi-n.red{color:#DC2626}
-    .kpi-l{font-size:.68em;text-transform:uppercase;letter-spacing:.7px;color:#94A3B8;margin-top:5px;font-weight:600}
-    .crit-alert{background:#FEF2F2;border:1px solid #FECACA;border-left:4px solid #DC2626;border-radius:10px;padding:14px 18px;margin-bottom:26px}
-    .crit-hdr{display:flex;align-items:center;gap:8px;font-weight:700;font-size:.86em;color:#991B1B;margin-bottom:10px}
-    .al-grid{display:flex;flex-wrap:wrap;gap:8px}
-    .al-item{background:#fff;border:1px solid #FECACA;border-radius:8px;padding:7px 12px;display:flex;align-items:center;gap:7px;font-size:.82em}
-    .al-ns{color:#94A3B8;font-weight:500}
-    .al-sep{color:#FECACA}
-    .al-name{color:#1E293B;font-weight:700}
-    .stitle{font-size:.67em;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#94A3B8;margin-bottom:11px;display:flex;align-items:center;gap:8px}
-    .stitle::after{content:'';flex:1;height:1px;background:#E2E8F0}
-    .tcves{background:#fff;border:1px solid #E2E8F0;border-radius:12px;overflow:hidden;margin-bottom:26px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
-    .tcves table{width:100%;border-collapse:collapse}
-    .tcves thead th{padding:10px 14px;text-align:left;font-size:.67em;text-transform:uppercase;letter-spacing:.7px;color:#94A3B8;font-weight:600;background:#F8FAFC;border-bottom:1px solid #E2E8F0}
-    .tcves tbody tr{border-bottom:1px solid #F1F5F9;transition:background .12s}
-    .tcves tbody tr:last-child{border:none}
-    .tcves tbody tr:hover{background:#F8FAFC}
-    .tcves td{padding:9px 14px;vertical-align:middle}
-    .rank{color:#CBD5E1;font-weight:700;font-size:.8em;width:32px}
-    .bar-cell{width:220px}
-    .barw{display:flex;align-items:center;gap:8px}
-    .barf{height:5px;background:#A7F3D0;border-radius:3px;min-width:3px}
-    .barl{font-size:.77em;color:#64748B;font-weight:600;white-space:nowrap}
-    .badge{display:inline-block;border-radius:20px;padding:2px 10px;font-size:.78em;font-weight:700;letter-spacing:.2px}
+    .brand-mark{width:10px;height:10px;background:var(--accent);border-radius:2px}
+    .brand-title{font-weight:700;font-size:.92em;color:var(--text);letter-spacing:-.01em}
+    .topbar-date{font-size:.78em;color:var(--text-3);font-variant-numeric:tabular-nums}
+    .alert-bar{background:var(--alert-bg);color:var(--alert-text);border-bottom:1px solid var(--alert-border);padding:10px 32px;font-size:.88em;position:sticky;top:52px;z-index:190}
+    .alert-bar strong{font-weight:700;margin-right:6px}
+    .container{max-width:1120px;margin:0 auto;padding:24px 24px 60px}
+    .filters{position:sticky;top:52px;z-index:100;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:20px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+    .alert-bar + .container .filters{top:calc(52px + 42px)}
+    .filters label{font-size:.7em;color:var(--text-2);font-weight:600;display:flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.6px}
+    .filters select,.filters input{font-family:inherit;font-size:.88em;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:5px 8px}
+    .filters select:focus,.filters input:focus{outline:2px solid var(--accent);outline-offset:-1px;background:var(--surface)}
+    .filters input[type="text"]{flex:1;min-width:220px}
+    .f-clear{background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:5px 12px;font-size:.82em;color:var(--text-2);cursor:pointer;font-weight:600}
+    .f-clear:hover{background:var(--surface);border-color:var(--border-strong)}
+    .f-count{font-size:.75em;color:var(--text-3);margin-left:auto;font-weight:600;font-variant-numeric:tabular-nums}
+    .kpi-strip{display:flex;flex-wrap:wrap;gap:0;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden;margin-bottom:32px}
+    .kpi-item{flex:1;min-width:130px;padding:16px 20px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:2px}
+    .kpi-item:last-child{border-right:0}
+    .kpi-num{font-size:1.8em;font-weight:700;color:var(--text);line-height:1;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+    .kpi-num.critical{color:var(--critical)}
+    .kpi-label{font-size:.7em;text-transform:uppercase;letter-spacing:.8px;color:var(--text-3);font-weight:600;margin-top:6px}
+    .section-title{font-size:.72em;text-transform:uppercase;letter-spacing:1.2px;color:var(--text-2);font-weight:700;margin:36px 0 4px;display:flex;align-items:center;gap:10px}
+    .section-title::after{content:'';flex:1;height:1px;background:var(--border)}
+    .section-note{font-size:.82em;color:var(--text-3);margin-bottom:14px}
+    .section-note code{background:var(--bg);color:var(--text-2);padding:1px 5px;border-radius:3px;font-size:.9em}
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;overflow:hidden}
+    .card-btn{width:100%;background:none;border:0;cursor:pointer;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:16px;color:inherit;text-align:left}
+    .card-btn:hover{background:var(--bg)}
+    .card-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;flex:1}
+    .card-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+    .card-body{display:none;padding:4px 16px 14px;border-top:1px solid var(--border)}
+    .chev{transition:transform .18s;display:flex;color:var(--text-3)}
+    .img-ref{display:inline-flex;align-items:baseline;gap:0;flex-wrap:wrap;min-width:0}
+    .img-repo{color:var(--text);font-weight:600;font-size:.92em}
+    .img-tag{display:inline-block;background:#DBEAFE;color:#1E40AF;font-weight:700;padding:1px 8px;border-radius:4px;margin:0 4px;font-size:.9em;letter-spacing:.2px}
+    .img-tag-missing{background:var(--bg);color:var(--text-3);font-weight:500}
+    .img-digest{color:var(--text-3);font-size:.8em;overflow:hidden;text-overflow:ellipsis}
+    .digest-t{color:var(--text-3);font-size:.82em;margin-left:2px}
+    .ns-name{font-weight:700;font-size:.92em;color:var(--text)}
+    .pill{background:var(--bg);color:var(--text-2);border:1px solid var(--border);border-radius:20px;padding:1px 8px;font-size:.72em;font-weight:600;font-variant-numeric:tabular-nums}
+    .pill-y{background:#FEF9C3;color:#854D0E;border-color:#FDE68A}
+    .pill-red{background:#FEE2E2;color:#991B1B;border-color:#FCA5A5}
+    .badge{display:inline-block;border-radius:20px;padding:2px 10px;font-size:.78em;font-weight:700;font-variant-numeric:tabular-nums}
     .s-max{background:#FEE2E2;color:#991B1B}
-    .s-crit{background:#FFEDD5;color:#9A3412}
-    .s-high{background:#FEF9C3;color:#854D0E}
-    .s-med{background:#DCFCE7;color:#166534}
-    .wb{border-radius:20px;padding:2px 8px;font-size:.71em;font-weight:600}
-    .wb-dep{background:#DBEAFE;color:#1D4ED8}
-    .wb-dconf{background:#EDE9FE;color:#6D28D9}
+    .s-crit{background:#FED7AA;color:#9A3412}
+    .s-high{background:#FEF3C7;color:#854D0E}
+    .s-med{background:#D1FAE5;color:#166534}
+    .wb{border-radius:4px;padding:1px 6px;font-size:.7em;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
+    .wb-dep{background:#DBEAFE;color:#1E40AF}
+    .wb-dconf{background:#EDE9FE;color:#5B21B6}
     .wb-job{background:#FEF3C7;color:#92400E}
-    .wb-ss{background:#DCFCE7;color:#15803D}
+    .wb-ss{background:#D1FAE5;color:#166534}
     .wb-pod{background:#FCE7F3;color:#9D174D}
-    .wb-other{background:#F1F5F9;color:#475569}
-    .pill{background:#F1F5F9;color:#64748B;border-radius:20px;padding:2px 8px;font-size:.71em;font-weight:600}
-    .pill-y{background:#FEF9C3;color:#854D0E}
-    .pill-red{background:#FEE2E2;color:#991B1B}
-    .copy-btn{background:none;border:1px solid #E2E8F0;border-radius:4px;padding:1px 6px;margin-left:6px;cursor:pointer;color:#64748B;font-size:.85em;line-height:1;transition:all .12s}
-    .copy-btn:hover{background:#F1F5F9;color:#0F172A;border-color:#CBD5E1}
-    .copy-btn.ok{background:#DCFCE7;color:#166534;border-color:#86EFAC}
-    .filters{position:sticky;top:58px;z-index:100;background:#fff;border:1px solid #E2E8F0;border-radius:10px;padding:10px 14px;margin-bottom:22px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;box-shadow:0 1px 4px rgba(0,0,0,.05)}
-    .filters label{font-size:.75em;color:#64748B;font-weight:600;display:flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.4px}
-    .filters select,.filters input{font-family:inherit;font-size:.88em;color:#0F172A;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:5px 8px;font-weight:400}
-    .filters select:focus,.filters input:focus{outline:2px solid #0EA5E9;outline-offset:-1px;background:#fff}
-    .filters input[type="text"]{flex:1;min-width:200px}
-    .f-clear{background:#F1F5F9;border:1px solid #E2E8F0;border-radius:6px;padding:5px 12px;font-size:.82em;color:#475569;cursor:pointer;font-weight:600}
-    .f-clear:hover{background:#E2E8F0}
-    .f-count{font-size:.75em;color:#94A3B8;margin-left:auto;font-weight:600}
-    .runs-in{font-size:.82em;color:#475569;margin-bottom:10px;padding:8px 10px;background:#F8FAFC;border-radius:6px;line-height:1.8}
-    .runs-in strong{color:#0F172A;font-size:.9em;margin-right:6px}
-    .run-chip{display:inline-flex;align-items:center;gap:4px;background:#fff;border:1px solid #E2E8F0;border-radius:6px;padding:2px 8px;margin:2px 4px 2px 0;font-size:.85em}
-    .ns-tag{color:#94A3B8;font-size:.9em}
-    .wl-cpill{background:#FFEDD5;color:#9A3412;border-radius:20px;padding:2px 8px;font-size:.71em;font-weight:600}
-    .ns-card{background:#fff;border:1px solid #E2E8F0;border-radius:12px;margin-bottom:9px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.04)}
-    .ns-btn{width:100%;background:none;border:none;cursor:pointer;padding:13px 16px;display:flex;align-items:center;justify-content:space-between;transition:background .14s}
-    .ns-btn:hover{background:#F8FAFC}
-    .ns-left{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-    .ns-right{display:flex;align-items:center;gap:8px}
-    .ns-name{font-weight:700;font-size:.92em;color:#0F172A}
-    .chev{transition:transform .2s;display:flex}
-    .ns-body{display:none;padding:4px 16px 14px;border-top:1px solid #F1F5F9}
-    .wl-card{background:#FAFAFA;border:1px solid #F1F5F9;border-radius:9px;padding:13px 15px;margin-top:11px}
-    .wl-hdr{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:7px;margin-bottom:7px}
-    .wl-left{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
-    .wl-name{font-weight:700;font-size:.9em;color:#0F172A}
-    .wl-img{display:flex;align-items:center;gap:5px;font-size:.77em;color:#94A3B8;margin-bottom:9px;flex-wrap:wrap}
-    .wl-img .mono{color:#64748B}
-    .digest-t{color:#94A3B8;font-size:.85em}
-    .cve-tbl{width:100%;border-collapse:collapse;font-size:.82em}
-    .cve-tbl thead tr{background:#F8FAFC}
-    .cve-tbl th{padding:5px 9px;text-align:left;font-size:.68em;text-transform:uppercase;letter-spacing:.5px;color:#94A3B8;font-weight:600;border-bottom:1px solid #E2E8F0}
-    .cve-tbl td{padding:6px 9px;border-bottom:1px solid #F1F5F9;vertical-align:middle}
-    .cve-tbl tr:last-child td{border:none}
-    .analysis{background:#fff;border:1px solid #E2E8F0;border-radius:14px;padding:26px;margin-top:36px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
-    .a-hdr{display:flex;align-items:flex-start;gap:14px;padding-bottom:18px;border-bottom:1px solid #F1F5F9;margin-bottom:20px}
-    .a-hdr h2{font-size:1.02em;font-weight:700;color:#0F172A}
-    .a-hdr p{font-size:.79em;color:#94A3B8;margin-top:3px}
-    .a-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-    @media(max-width:720px){.a-grid{grid-template-columns:1fr}}
-    .a-card{background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:16px}
-    .a-red{background:#FEF2F2;border-color:#FECACA}
-    .a-green{background:#F0FDF4;border-color:#BBF7D0}
-    .a-title{display:flex;align-items:center;gap:7px;font-weight:700;font-size:.84em;color:#1E293B;margin-bottom:11px}
-    .a-list{padding-left:16px;font-size:.82em;color:#475569;line-height:1.75}
-    .a-list li{margin-bottom:7px}
-    .nb-link{display:flex;align-items:center;gap:8px;text-decoration:none;color:inherit}
-    .nb-link:hover .nb-name{color:#00693C}
-    .nb-name{font-weight:800;font-size:.95em;color:#0F172A;letter-spacing:-.3px}
-    .brand-sep{width:1px;height:22px;background:#E2E8F0;margin:0 6px}
-    .footer{text-align:center;color:#CBD5E1;font-size:.72em;margin-top:36px;padding-bottom:16px}
+    .wb-other{background:var(--bg);color:var(--text-2)}
+    .wl-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 14px;margin-top:10px}
+    .wl-hdr{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:6px}
+    .wl-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    .wl-name{font-weight:700;font-size:.9em;color:var(--text)}
+    .wl-cpill{background:#FED7AA;color:#9A3412;border-radius:20px;padding:1px 8px;font-size:.72em;font-weight:600}
+    .wl-img{display:flex;align-items:baseline;gap:0;font-size:.85em;margin-bottom:10px;flex-wrap:wrap}
+    .cve-tbl{width:100%;border-collapse:collapse;font-size:.85em;background:var(--surface);border-radius:5px;overflow:hidden}
+    .cve-tbl thead th{padding:8px 10px;text-align:left;font-size:.68em;text-transform:uppercase;letter-spacing:.6px;color:var(--text-3);font-weight:700;background:var(--bg);border-bottom:1px solid var(--border)}
+    .cve-tbl td{padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:middle}
+    .cve-tbl tbody tr:last-child td{border-bottom:0}
+    .cve-tbl tbody tr:hover{background:var(--bg)}
+    .runs-in{font-size:.82em;color:var(--text-2);margin:10px 0;padding:8px 10px;background:var(--bg);border-radius:5px;line-height:1.8}
+    .runs-in strong{color:var(--text);font-size:.88em;margin-right:6px;text-transform:uppercase;letter-spacing:.5px}
+    .run-chip{display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:1px 8px;margin:2px 4px 2px 0;font-size:.9em}
+    .ns-tag{color:var(--text-3);font-size:.9em}
+    .copy-btn{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:1px 6px;margin-left:6px;cursor:pointer;color:var(--text-2);font-size:.9em;line-height:1;transition:all .1s}
+    .copy-btn:hover{background:var(--bg);color:var(--text);border-color:var(--border-strong)}
+    .copy-btn.ok{background:#D1FAE5;color:#166534;border-color:#6EE7B7}
+    .copy-btn-ref{padding:2px 8px;font-size:.9em;margin-left:8px}
+    .tbl-wrap{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+    .tbl-widespread{width:100%;border-collapse:collapse;font-size:.9em}
+    .tbl-widespread thead th{padding:10px 14px;text-align:left;font-size:.68em;text-transform:uppercase;letter-spacing:.6px;color:var(--text-3);font-weight:700;background:var(--bg);border-bottom:1px solid var(--border)}
+    .tbl-widespread td{padding:9px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+    .tbl-widespread tbody tr:last-child td{border-bottom:0}
+    .w-bar{width:280px}
+    .bar-wrap{display:flex;align-items:center;gap:8px}
+    .bar-fill{height:6px;background:linear-gradient(90deg,var(--accent),#34D399);border-radius:3px;min-width:4px}
+    .bar-label{font-size:.85em;color:var(--text-2);font-weight:600;font-variant-numeric:tabular-nums}
+    .footer{text-align:center;color:var(--text-3);font-size:.72em;margin-top:40px;padding-bottom:16px;letter-spacing:.4px}
+    @media(max-width:720px){.kpi-item{min-width:50%}.container{padding:16px 12px 40px}.topbar{padding:0 16px}}
     """
 
     return f"""<!DOCTYPE html>
@@ -724,66 +509,21 @@ def build_html(namespaces):
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Container Vulnerability Report</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>{css}</style>
 </head>
 <body>
-<div class="topbar">
+<header class="topbar">
   <div class="brand">
-    <a href="https://www.novobanco.pt/particulares" target="_blank" rel="noopener" class="nb-link">
-      <svg width="28" height="28" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <rect width="40" height="40" rx="6" fill="#00693C"/>
-        <text x="50%" y="55%" dominant-baseline="middle" text-anchor="middle" fill="white" font-size="13" font-family="Inter,Segoe UI,sans-serif" font-weight="800">nb</text>
-      </svg>
-      <span class="nb-name">novobanco</span>
-    </a>
-    <div class="brand-sep"></div>
-    <div class="brand-dot"></div>
-    <span class="brand-t">Security Report <span class="brand-s">Defender for Cloud</span></span>
+    <span class="brand-mark"></span>
+    <span class="brand-title">Container Vulnerability Report</span>
   </div>
   <span class="topbar-date">{now}</span>
-</div>
-<div class="hero">
-  <h1><strong>Container Vulnerability</strong> Report</h1>
-  <p>Microsoft Defender for Cloud &nbsp;&middot;&nbsp; Cluster Cross-Reference &nbsp;&middot;&nbsp; CVSS &ge; 9.0</p>
-  <div class="health-wrap">
-    <div class="health-meta">
-      <span class="health-lbl">Cluster Health</span>
-      <span class="health-score" style="color:{health_color}">{health_score}<span class="health-total">/100</span></span>
-      <span class="health-tag" style="background:{health_color}22;color:{health_color};border:1px solid {health_color}44">{health_label}</span>
-    </div>
-    <div class="health-track">
-      <div class="health-gradient-bar"></div>
-      <div class="health-marker" style="left:calc({health_score}% - 6px)"></div>
-    </div>
-    <p class="health-insight">{health_insight}</p>
-  </div>
-</div>
+</header>
+{alert_html}
 <div class="container">
-  <div class="kpis" style="margin-top:26px">
-    <div class="kpi">{ic("namespace",20,"#94A3B8")}<div class="kpi-n">{total_ns}</div><div class="kpi-l">Namespaces</div></div>
-    <div class="kpi">{ic("workload",20,"#94A3B8")}<div class="kpi-n">{total_w}</div><div class="kpi-l">Workloads</div></div>
-    <div class="kpi">{ic("cve",20,"#94A3B8")}<div class="kpi-n">{unique_cves}</div><div class="kpi-l">Unique CVEs</div></div>
-    <div class="kpi">{ic("entries",20,"#94A3B8")}<div class="kpi-n">{total_e}</div><div class="kpi-l">CVE Entries</div></div>
-    <div class="kpi">{ic("critical",20,"#94A3B8")}<div class="kpi-n red">{s10_count}</div><div class="kpi-l">Score 10.0</div></div>
-    <div class="kpi" title="CVE entries with verified exploit, published PoC, or known exploit kit">{ic("zap",20,"#94A3B8")}<div class="kpi-n {"red" if weap_count > 0 else ""}">{weap_count}</div><div class="kpi-l">Weaponized</div></div>
-  </div>
-  <div class="drivers-section">
-    <div class="drivers-header">
-      {ic("alert",14,"#94A3B8")}
-      <span class="drivers-title">Drivers of Risk</span>
-    </div>
-    <div class="drivers-grid">
-      {"".join(
-          f'<div class="driver-card">'
-          f'<div class="driver-card-name">{name}</div>'
-          f'<div class="driver-card-val">{detail}</div>'
-          f'</div>'
-          for name, _pct, detail in risk_drivers
-      )}
-    </div>
-  </div>
-  {alert_html}
   <div class="filters" role="region" aria-label="Filters">
     <label>Severity
       <select id="fSev" onchange="applyFilters()">
@@ -807,18 +547,33 @@ def build_html(namespaces):
         <option value="1">Any exploit</option>
       </select>
     </label>
-    <input type="text" id="fSearch" placeholder="Filter by namespace / repo / workload…" oninput="applyFilters()"/>
+    <input type="text" id="fSearch" placeholder="Filter by namespace, repo, workload…" oninput="applyFilters()"/>
     <button class="f-clear" onclick="clearFilters()">Clear</button>
     <span class="f-count" id="fCount"></span>
   </div>
-  <div class="stitle">Vulnerable Images &mdash; sorted by max CVSS</div>
+
+  <div class="kpi-strip">
+    <div class="kpi-item"><span class="kpi-num">{total_images}</span><span class="kpi-label">Images</span></div>
+    <div class="kpi-item"><span class="kpi-num">{total_w}</span><span class="kpi-label">Workloads</span></div>
+    <div class="kpi-item"><span class="kpi-num">{unique_cves}</span><span class="kpi-label">Unique CVEs</span></div>
+    <div class="kpi-item"><span class="kpi-num">{total_e}</span><span class="kpi-label">CVE entries</span></div>
+    <div class="kpi-item"><span class="{s10_cls}">{s10_count}</span><span class="kpi-label">Score 10.0</span></div>
+    <div class="kpi-item"><span class="{weap_cls}">{weap_count}</span><span class="kpi-label">Weaponized</span></div>
+  </div>
+
+  <h2 class="section-title">Vulnerable Images</h2>
+  <p class="section-note">Grouped by <code>repo:tag@digest</code>. Sorted by max CVSS descending. Top {min(3, total_images)} expanded by default.</p>
   {image_cards}
-  <div class="stitle">Most Widespread CVEs</div>
-  {cve_accordion}
-  <div class="stitle">Namespace Detail &mdash; sorted by CVE count</div>
+
+  <h2 class="section-title">Namespace Detail</h2>
+  <p class="section-note">Same findings organized by OpenShift namespace and workload. Sorted by CVE count.</p>
   {ns_html}
-  {analysis}
-  <div class="footer">Confidential &nbsp;&middot;&nbsp; Internal Use Only &nbsp;&middot;&nbsp; {now}</div>
+
+  <h2 class="section-title">Most Widespread CVEs</h2>
+  <p class="section-note">Reference view — CVEs sorted by number of workloads they affect.</p>
+  {widespread_html}
+
+  <div class="footer">Confidential · Internal Use Only · Generated {now}</div>
 </div>
 <script>
 function toggle(b){{var d=b.nextElementSibling;var o=d.style.display==='block';d.style.display=o?'none':'block';var c=b.querySelector('.chev');if(c)c.style.transform=o?'':'rotate(180deg)';}}
@@ -836,7 +591,7 @@ function applyFilters(){{
     if(expl==='1'&&row.dataset.expl!=='1')ok=false;
     row.style.display=ok?'':'none';
   }});
-  document.querySelectorAll('.ns-card').forEach(function(card){{
+  document.querySelectorAll('.card').forEach(function(card){{
     var s=card.dataset.search||'';
     var searchOk=!search||s.indexOf(search)!==-1;
     var totalRows=card.querySelectorAll('tr[data-sev]').length;
@@ -860,7 +615,6 @@ document.addEventListener('DOMContentLoaded',applyFilters);
 </script>
 </body>
 </html>"""
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate a modern executive HTML vulnerability report.",

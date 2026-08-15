@@ -266,5 +266,9 @@ class TestBuildHtmlEdgeCases:
         sum_p, exp_p = self._minimal_csvs(tmp_path, sum_rows, exp_rows)
         ns = report.load_data(str(sum_p), str(exp_p))
         html = report.build_html(ns)
-        assert "Maximum Severity" in html
-        assert html.count("CVSS 10.0") >= 1
+        # After the redesign (task #35), the critical-alert copy lives in the
+        # sticky alert bar at the top with the phrase "Immediate action".
+        assert "Immediate action" in html
+        assert "CVSS 10.0" in html
+        # Score 10.0 KPI should render with the `critical` red variant.
+        assert 'class="kpi-num critical"' in html

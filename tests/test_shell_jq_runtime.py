@@ -43,15 +43,17 @@ def _run_jq(program: str, stdin: str, args: list[str] | None = None) -> str:
 
 
 def _extract_check_ocp_jq() -> str:
-    """Pull the jq program from check_ocp.sh's `oc get pods ... | jq -r '...'`."""
+    """Pull the jq program from check_ocp.sh.
+
+    Since the hardening refactor (task #28), the program lives in a bash
+    variable `JQ_POD_EXTRACT='...'` so we look for that assignment.
+    """
     text = CHECK_OCP.read_text(encoding="utf-8")
-    # Match the block: `jq -r '<program>' 2>/dev/null` where the closing quote
-    # must be exactly `'` — a `\'` here is the exact bug the gestor flagged.
     match = re.search(
-        r"jq\s+-r\s+'(.*?)'\s*2>/dev/null\)",
+        r"JQ_POD_EXTRACT='(.*?)'\s*\n",
         text, re.DOTALL,
     )
-    assert match, "could not locate the jq -r block in check_ocp.sh"
+    assert match, "could not locate JQ_POD_EXTRACT in check_ocp.sh"
     return match.group(1)
 
 
