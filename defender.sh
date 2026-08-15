@@ -744,7 +744,9 @@ QUERY_FILE=$(mktemp)
 # Cleanup: always remove the KQL temp file; also remove the partial CSV tmp
 # if we exited before the final rename. When the loop succeeds we unset
 # REPORT_TMP so the trap leaves the final report in place.
-trap 'rm -f "$QUERY_FILE" ${REPORT_TMP:+"$REPORT_TMP"}' EXIT
+# Compose with any trap already registered (init_logging sets one for the
+# tee flush). Overwriting would drop that flush and truncate the log tail.
+_add_exit_trap 'rm -f "$QUERY_FILE" ${REPORT_TMP:+"$REPORT_TMP"}'
 
 # Pre-compute early filter snippets to inject INSIDE each leg before extends/mv-expand.
 # This lets ARG push the filters down and avoid scanning the whole subscription.

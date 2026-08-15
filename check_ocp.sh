@@ -77,7 +77,8 @@ echo "A verificar workloads e cruzar dados..."
 
 # Arquivo temporário para os dados brutos (flat)
 RAW_OUTPUT="/tmp/raw_findings_flat.csv"
-trap 'rm -f "$RAW_OUTPUT"' EXIT
+# Compose with any trap init_logging already registered (tee flush).
+_add_exit_trap 'rm -f "$RAW_OUTPUT"'
 echo "NAMESPACE,PARENT_TYPE,PARENT_NAME,repository,digest,tag,cvssScore,cveId,severity,packageCategory,packageLanguage,packageName,currentVersion,fixedVersion,patchable,remediation,fixStatus,cveAgeDays,isInExploitKit,hasPublishedExploit,hasVerifiedExploit,lastPushedToRegistryUTC" > "$RAW_OUTPUT"
 
 # ── Per-namespace state counters ────────────────────────────────────────────

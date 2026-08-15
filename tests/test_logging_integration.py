@@ -109,8 +109,9 @@ class TestDefenderLogging:
 
         logs = list((tmp_path / "logs").glob("run-*.log"))
         assert len(logs) == 1, f"expected 1 log file, got {logs}"
-        assert re.match(r"run-\d{8}-\d{6}\.log$", logs[0].name), \
-            f"log name should be run-YYYYMMDD-HHMMSS.log, got {logs[0].name}"
+        # Task #40: name includes PID → collision-safe under parallel CI.
+        assert re.match(r"run-\d{8}-\d{6}-\d+\.log$", logs[0].name), \
+            f"log name should be run-YYYYMMDD-HHMMSS-<pid>.log, got {logs[0].name}"
 
     def test_log_header_contains_context(self, tmp_path: Path) -> None:
         bin_dir = tmp_path / "bin"
@@ -281,3 +282,150 @@ init_logging "test-script" "test-mode" {' '.join(f'"{a}"' for a in args)}
         assert "myacr" in content
         assert "app,payments" in content
         assert "<redacted>" not in content
+
+
+# ---------------------------------------------------------------------------
+# Task #40: graceful degradation + trap composition + unique PID in name
+# ---------------------------------------------------------------------------
+
+class TestGracefulDegradation:
+    """When tee/process-substitution is unavailable, init_logging must WARN
+    and let the caller continue with terminal-only output. Never kill the run."""
+
+    def test_degrades_when_tee_missing(self, tmp_path: Path) -> None:
+        # PATH points to a directory with NO `tee` — the probe should fail
+        # gracefully and the caller keeps running. We simulate by pointing
+        # PATH to an empty bin dir + stubbing bash builtins we still need.
+        empty_bin = tmp_path / "empty_bin"
+        empty_bin.mkdir()
+        # Bring in the minimum so the shell can still work — but no tee.
+        for tool in ("bash", "mkdir", "date", "sed", "cat"):
+            real = shutil.which(tool)
+            if real:
+                (empty_bin / tool).symlink_to(real)
+        env = {"PATH": str(empty_bin), "HOME": os.environ.get("HOME", "/tmp")}
+
+        runner = tmp_path / "run.sh"
+        runner.write_text(f"""#!/usr/bin/env bash
+set -euo pipefail
+cd "{tmp_path}"
+source "{REPO_ROOT}/lib/logging.sh"
+init_logging "test" "test-mode" --foo bar
+echo "still alive after init_logging"
+""", encoding="utf-8")
+        runner.chmod(0o755)
+
+        result = subprocess.run(
+            [str(runner)], cwd=tmp_path, env=env,
+            capture_output=True, text=True, check=False,
+        )
+        # Caller survived (exit 0) even though tee wasn't available.
+        assert result.returncode == 0, (
+            f"init_logging killed the run when tee was missing:\n{result.stderr}"
+        )
+        # Warning surfaced.
+        assert "logging" in result.stderr.lower()
+        assert "not" in result.stderr.lower()
+        # And the post-init line printed — proving the shell kept going.
+        assert "still alive after init_logging" in result.stdout
+
+    def test_degrades_when_logs_dir_not_writable(self, tmp_path: Path) -> None:
+        # Point LOG_DIR at a path that can't be created (parent is a file).
+        blocker = tmp_path / "notadir"
+        blocker.write_text("i am a file, not a directory\n")
+
+        runner = tmp_path / "run.sh"
+        runner.write_text(f"""#!/usr/bin/env bash
+set -euo pipefail
+export LOG_DIR="{blocker}/logs"
+source "{REPO_ROOT}/lib/logging.sh"
+init_logging "test" "test-mode"
+echo "post-init OK"
+""", encoding="utf-8")
+        runner.chmod(0o755)
+
+        result = subprocess.run(
+            [str(runner)], cwd=tmp_path,
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0
+        assert "could not create" in result.stderr.lower()
+        assert "post-init OK" in result.stdout
+
+
+class TestExitTrapComposition:
+    """init_logging must not clobber a pre-existing EXIT trap. And a caller
+    that later adds its own trap via _add_exit_trap must also compose."""
+
+    def test_preexisting_trap_is_preserved(self, tmp_path: Path) -> None:
+        marker = tmp_path / "marker"
+        runner = tmp_path / "run.sh"
+        runner.write_text(f"""#!/usr/bin/env bash
+set -euo pipefail
+cd "{tmp_path}"
+trap 'echo "PREEXISTING RAN" > "{marker}"' EXIT
+source "{REPO_ROOT}/lib/logging.sh"
+init_logging "test" "test-mode"
+echo "body"
+""", encoding="utf-8")
+        runner.chmod(0o755)
+        result = subprocess.run(
+            [str(runner)], cwd=tmp_path,
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert marker.exists(), (
+            "init_logging clobbered the pre-existing EXIT trap"
+        )
+        assert marker.read_text().strip() == "PREEXISTING RAN"
+
+    def test_defender_cleanup_still_runs_alongside_logging(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end proof: defender.sh's own EXIT trap (cleans QUERY_FILE
+        + REPORT_TMP) must run alongside the tee-flush trap set by
+        init_logging. If either is dropped, we regress."""
+        bin_dir = tmp_path / "bin"
+        _make_fake_az(bin_dir)
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+        result = subprocess.run(
+            [str(DEFENDER), "--acr-name", "myacr", "--min-score", "9"],
+            cwd=tmp_path, env=env, capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+        # 1) Log was written (tee flush trap ran).
+        log = next((tmp_path / "logs").glob("run-*.log"))
+        assert "Processing complete" in log.read_text(encoding="utf-8")
+
+        # 2) defender.sh's cleanup trap ran too: REPORT_TMP files must be
+        # gone. defender.sh names them "<REPORT_FILE>.tmp.<pid>" and moves
+        # them onto the final path on success — no leftovers on disk.
+        leftover_tmps = list(tmp_path.glob("*.csv.tmp.*"))
+        assert not leftover_tmps, (
+            f"defender.sh cleanup was clobbered — leftover tmp files: {leftover_tmps}"
+        )
+
+
+class TestUniquePidInName:
+    """Two runs in the same second must produce two distinct log files."""
+
+    def test_two_runs_produce_distinct_files(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        _make_fake_az(bin_dir)
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+        for _ in range(2):
+            subprocess.run(
+                [str(DEFENDER), "--acr-name", "myacr", "--min-score", "9"],
+                cwd=tmp_path, env=env,
+                capture_output=True, text=True, check=False,
+            )
+        logs = sorted((tmp_path / "logs").glob("run-*.log"))
+        assert len(logs) == 2, (
+            f"expected 2 distinct log files (PID differs), got {logs}"
+        )
+        assert logs[0].name != logs[1].name
