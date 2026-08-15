@@ -53,9 +53,10 @@ mkdir -p "$WORK/bin"
 cat > "$WORK/bin/az" <<AZEOF
 #!/usr/bin/env bash
 # Log every invocation as ONE line so counts via wc -l stay accurate.
-# `az graph query -q "\$KQL"` receives a multi-line KQL string; \$*
-# expansion would emit those newlines into the log and inflate the count.
-# Parameter expansion replaces LF with the escape "\\n".
+# az graph query passes the multi-line KQL text as one argument; without
+# sanitization the newlines inside would be written to the log verbatim
+# and inflate the wc-based call count. Parameter expansion collapses LF
+# into the two-char sequence backslash-n before writing.
 _call="\${*//\$'\\n'/\\\\n}"
 printf '%s\\n' "\$_call" >> "$WORK/az_calls.log"
 

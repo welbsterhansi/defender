@@ -31,6 +31,21 @@ These are the rules Copilot must follow when suggesting or making changes.
 - A change to a shell script must pass `bash -n` and, when applicable, must
   validate the embedded tool at runtime — `jq` expressions with mock JSON,
   `az` / `oc` interactions via `PATH`-mocked binaries.
+- Any new executable shell entry point must be added to `make lint` (`bash -n`
+  and `shellcheck --severity=warning`) and must have a tiny happy-path smoke
+  test or Make target that runs locally with fake inputs, exits `0`, and emits
+  no unexpected stderr.
+- Benchmark and diagnostic scripts must be tested for stable output shape and
+  counters, but tests must not assert absolute timing values.
+- Heredocs that generate shell scripts are runtime-risky under `set -u`: if the
+  generated body contains inner-script variables such as `$KQL`, `$1`, `$PATH`,
+  command substitutions, or backticks, use a quoted heredoc (`<<'EOF'`) when
+  possible. If outer interpolation is required, escape every inner-script
+  expansion (`\$VAR`, `\$(...)`) and run the generated script path in a smoke
+  test.
+- Do not treat `bash -n` or `shellcheck` as sufficient for generated scripts;
+  they can miss heredoc expansion errors that only appear when the parent
+  script runs.
 
 ## 3. Pipeline
 

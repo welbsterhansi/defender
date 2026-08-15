@@ -113,6 +113,14 @@ shellcheck defender.sh check_ocp.sh
 
 Tests live in `tests/` with fixtures generated programmatically in `tests/conftest.py` (no committed CSV samples).
 
+Shell-script changes need runtime coverage, not just syntax/lint:
+
+- Any new executable shell entry point must be added to `make lint` (`bash -n` and `shellcheck --severity=warning`).
+- Any new executable shell entry point must have a tiny happy-path smoke test or Make target that runs it locally with fake inputs, exits `0`, and produces no unexpected stderr.
+- Benchmark/diagnostic scripts must be tested for stable output shape and counters, but tests must not assert absolute timing values.
+- Heredocs that generate shell scripts are runtime-risky under `set -u`: if the generated body contains inner-script variables such as `$KQL`, `$1`, `$PATH`, command substitutions, or backticks, use a quoted heredoc (`<<'EOF'`) when possible. If outer interpolation is required, escape every inner-script expansion (`\$VAR`, `\$(...)`) and run the generated script path in a smoke test.
+- Do not treat `bash -n` or `shellcheck` as sufficient for generated scripts; they can miss heredoc expansion errors that only appear when the parent script runs.
+
 ## CSV schemas
 
 ### `vulnerable_images_report.csv` (defender.sh)
