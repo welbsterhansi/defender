@@ -2,7 +2,11 @@
 
 Local pipeline that scans an **Azure Container Registry (ACR)** for image vulnerabilities via **Microsoft Defender for Cloud**, cross-references the results against **workloads running in OpenShift**, and produces an executive HTML report ranked by CVSS score and exploit availability.
 
-> Deep technical reference for AI assistants and IDEs: see [AGENTS.md](./AGENTS.md).
+> **AI assistants:**
+> - GitHub Copilot reads [`.github/copilot-instructions.md`](./.github/copilot-instructions.md) automatically.
+> - Claude Code / Cursor / Aider read [`AGENTS.md`](./AGENTS.md).
+>
+> Both files carry the same rules (make check as merge gate, don't touch the KQL, no client names in source, etc.). Update both if a rule changes.
 
 ## Prerequisites
 
