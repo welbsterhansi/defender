@@ -27,6 +27,17 @@ Target runtime is Linux / WSL (bash 4+). macOS works for local dev if you instal
 ./defender.sh --acr-name <ACR_NAME> --min-score 9 --max-score 10
 #    → vulnerable_images_report.csv
 
+# Broad scope by substring (single repo):
+./defender.sh --acr-name <ACR_NAME> --min-score 9 --repository app
+#    → matches 'app', 'app-backend', 'myapp'  (contains semantics)
+
+# Controlled scope by exact repo names (curated list):
+./defender.sh --acr-name <ACR_NAME> --min-score 9 --repositories app-backend,payments-api,catalog-svc
+#    → matches ONLY those three exact repos
+#    → 'app' would NOT capture 'app-backend'
+#    → each entry validated against the ACR before the query runs
+#    → empty entries (',,') or duplicates abort the run
+
 # 2. Cross-reference with running OpenShift workloads
 ./check_ocp.sh vulnerable_images_report.csv resultado_cruzamento.csv
 #    → resultado_cruzamento.csv (one row per workload+image, CVEs aggregated)
