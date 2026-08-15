@@ -69,6 +69,31 @@ classify_severity() {
 }
 
 # ---------------------------------------------------------------------------
+# Elapsed-time helper for per-page instrumentation (task #42, PR-0).
+# Uses bash 5's $EPOCHREALTIME (seconds.microseconds). On bash 4 the value
+# is empty and we return "0" — the log line still emits, ops just see 0ms
+# and know the env doesn't support timing.
+# ---------------------------------------------------------------------------
+_now_realtime() {
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        printf '%s' "$EPOCHREALTIME"
+    else
+        printf '0'
+    fi
+}
+_elapsed_ms() {
+    local start="${1:-0}"
+    local now
+    now=$(_now_realtime)
+    awk -v s="$start" -v n="$now" 'BEGIN {
+        if (s == "" || s == "0" || n == "0") { print 0; exit }
+        d = n - s
+        if (d < 0) d = 0
+        printf "%d", d * 1000
+    }'
+}
+
+# ---------------------------------------------------------------------------
 # List repositories with an explicit upper bound (default `az acr repository
 # list` returns only 100). 5000 is the server-side max for the wrapper; if
 # an ACR ever grows beyond that a warning is emitted so the operator can
@@ -938,6 +963,10 @@ PAGE_NUM=0
 
 while : ; do
     PAGE_NUM=$((PAGE_NUM + 1))
+    _t_page_start=$(_now_realtime)
+
+    # ── phase 1: graph_query ────────────────────────────────────────────
+    _t_graph_start=$(_now_realtime)
     # Fail-fast: if the query keeps failing after 3 tries, abort with a clear
     # message so operators don't consume a truncated CSV as authoritative.
     # Call directly (no $(...)) so globals set by the function survive.
@@ -950,6 +979,8 @@ while : ; do
     # Defensive: `run_graph_query` already validated .data exists, but if jq
     # ever hiccups we treat it as end-of-results rather than crash.
     BATCH_COUNT=$(printf '%s' "$RESPONSE" | jq '.data | length' 2>/dev/null || echo 0)
+    _t_graph_ms=$(_elapsed_ms "$_t_graph_start")
+
     if [ -z "$BATCH_COUNT" ] || [ "$BATCH_COUNT" -eq 0 ]; then
         echo "[Page ${PAGE_NUM}] batch=0 → end of results"
         break
@@ -957,6 +988,9 @@ while : ; do
 
     echo "[Page ${PAGE_NUM}] batch=${BATCH_COUNT} images, total_before=${TOTAL_PROCESSED}, retries=${LAST_QUERY_RETRIES}"
 
+    # ── phase 2: tag_resolve (per-page tag cache) ────────────────────────
+    _t_tags_start=$(_now_realtime)
+    _tag_api_calls=0
     # Build tag cache for unique repo+digest pairs in this batch (1 call per unique digest)
     declare -A TAG_CACHE
     while IFS= read -r cache_entry; do
@@ -964,6 +998,7 @@ while : ; do
         c_digest=$(echo "$cache_entry" | base64 --decode | jq -r '.digest')
         cache_key="${c_repo}@${c_digest}"
         if [ -z "${TAG_CACHE[$cache_key]+x}" ]; then
+            _tag_api_calls=$((_tag_api_calls + 1))
             c_tag=$(az acr repository show-tags \
                 --name "$ACR_NAME" \
                 --repository "$c_repo" \
@@ -973,6 +1008,10 @@ while : ; do
             TAG_CACHE[$cache_key]="${c_tag:-N/A}"
         fi
     done < <(echo "$RESPONSE" | jq -r '.data[] | @base64')
+    _t_tags_ms=$(_elapsed_ms "$_t_tags_start")
+
+    # ── phase 3: rows (parse + CSV write) ────────────────────────────────
+    _t_rows_start=$(_now_realtime)
 
     # Process each image in the batch.
     # jq @base64 encodes each row so special chars survive shell interpolation.
@@ -1054,8 +1093,14 @@ while : ; do
         
         TOTAL_PROCESSED=$((TOTAL_PROCESSED + 1))
     done < <(echo "$RESPONSE" | jq -r '.data[] | @base64')
+    _t_rows_ms=$(_elapsed_ms "$_t_rows_start")
+    _t_total_ms=$(_elapsed_ms "$_t_page_start")
 
     echo "[Page ${PAGE_NUM}] done, total_after=${TOTAL_PROCESSED}"
+    # Structured per-page timing, one line per page. Stable format for
+    # dashboards and benchmark parsing — do not reorder without updating
+    # scripts/benchmark-defender.sh.
+    log_info "page ${PAGE_NUM} batch=${BATCH_COUNT} total=${TOTAL_PROCESSED} retries=${LAST_QUERY_RETRIES} tag_api_calls=${_tag_api_calls} timings_ms=graph_query:${_t_graph_ms} tag_resolve:${_t_tags_ms} rows:${_t_rows_ms} total:${_t_total_ms}"
 
     # Check for next page
     SKIP_TOKEN=$(printf '%s' "$RESPONSE" | jq -r '.skip_token // empty' 2>/dev/null || true)

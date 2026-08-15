@@ -53,6 +53,7 @@ Primary consumers: platform SRE team (report), developers (remediation actions),
 | `tests/`              | Python   | pytest suite with synthetic CSV fixtures. |
 | `pyproject.toml`      | -        | pytest, ruff, and pyright configuration. |
 | `lib/logging.sh`      | Bash     | Sourced by both shells. `init_logging <script> <mode> [args...]` opens `logs/run-YYYYMMDD-HHMMSS-<pid>.log` for structured critical events. `log_info`/`log_warn`/`log_error` write to stderr always and append to the file best-effort. **Never fails the caller**: any file-write error surfaces as a WARN and the script keeps running. Scrubs values of `--token`/`--password`/`--secret`/`--*key` flags in the header. |
+| `scripts/benchmark-defender.sh` | Bash | Local perf harness. Plants a fake `az` on `PATH` (configurable pages, rows/page, repos, latency-per-call) and runs `defender.sh` against it. Parses the `timings_ms=` log lines emitted per page and prints an aggregate breakdown. Not a CI test — used to measure the impact of optimizations without waiting for a real ACR scan. |
 
 ## Running the pipeline
 

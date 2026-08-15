@@ -95,6 +95,24 @@ These are the rules Copilot must follow when suggesting or making changes.
 
 ---
 
+## Performance / telemetry
+
+`defender.sh` emits a stable per-page timing line via `log_info`:
+
+```
+page N batch=... total=... retries=... tag_api_calls=... timings_ms=graph_query:NNN tag_resolve:NNN rows:NNN total:NNN
+```
+
+Field order and names are a public interface — dashboards, CI graphs and `scripts/benchmark-defender.sh` parse it. If you must change the layout, update `tests/test_defender_timing_log_format.py` and the benchmark script in the same PR.
+
+For performance work, run the local benchmark first (no live Azure needed):
+
+```bash
+scripts/benchmark-defender.sh --pages 3 --rows-per-page 1000 --latency-ms 20
+```
+
+Capture before/after numbers in the PR description. Never assert on absolute timing values in tests.
+
 ## Merge gate
 
 ```bash
