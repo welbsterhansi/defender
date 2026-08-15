@@ -1,0 +1,28 @@
+# Local agent configuration — never commit
+claude.md
+CLAUDE.md
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Generated artifacts (regenerated per run)
+vulnerable_images_report.csv
+blocked_images_report.csv
+resultado_cruzamento.csv
+expanded.csv
+vulnerability_report.html
+
+# macOS
+.DS_Store
+
+# Local planning notes — not for the client repo
+NOTES.md
+boss-list.txt
