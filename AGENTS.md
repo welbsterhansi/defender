@@ -1,6 +1,8 @@
 # AGENTS.md
 
-Context for AI coding assistants (GitHub Copilot, Claude, etc.) working on this repository.
+Context for AI coding assistants (Claude Code, Cursor, Aider, etc.) working on this repository.
+
+> **GitHub Copilot uses [`.github/copilot-instructions.md`](./.github/copilot-instructions.md)** — that file carries the same rules in Copilot's native location. Keep the two files aligned if a rule changes.
 
 ## Purpose
 
