@@ -4,7 +4,7 @@ Unit tests for report.py — the HTML render stage.
 Complements the E2E test with focused coverage of the pure helpers and
 edge cases in the aggregation logic:
   - `_is_weaponized`   — flag OR semantics + case handling
-  - `_exploit_icon`    — precedence verified > published > kit > none
+  - `_exploit_cell`    — 3 independent V/P/K signal chips
   - `_version_cell`    — escapes HTML in package/version to prevent injection
   - `_cve_row`         — data-* attributes populated for the filter JS
   - `build_image_view` — dedup, sort, weaponized_count with N workloads
@@ -47,28 +47,32 @@ class TestIsWeaponized:
 
 
 # ---------------------------------------------------------------------------
-# _exploit_icon — precedence
+# _exploit_cell — 3 independent chips (V/P/K)
 # ---------------------------------------------------------------------------
 
-class TestExploitIcon:
-    def test_verified_beats_published(self) -> None:
-        assert report._exploit_icon({
+class TestExploitCell:
+    def test_all_three_signals_render_independently(self) -> None:
+        cell = report._exploit_cell({
             "hasVerifiedExploit": "true",
             "hasPublishedExploit": "true",
             "isInExploitKit": "true",
-        }) == "🔴"
+        })
+        assert 'class="expl-chip on-v"' in cell
+        assert 'class="expl-chip on-p"' in cell
+        assert 'class="expl-chip on-k"' in cell
 
-    def test_published_beats_kit(self) -> None:
-        assert report._exploit_icon({
-            "hasPublishedExploit": "true",
-            "isInExploitKit": "true",
-        }) == "🟠"
+    def test_no_signals_all_off(self) -> None:
+        cell = report._exploit_cell({})
+        assert cell.count('class="expl-chip off"') == 3
 
-    def test_kit_only(self) -> None:
-        assert report._exploit_icon({"isInExploitKit": "true"}) == "🟡"
+    def test_single_signal_others_off(self) -> None:
+        cell = report._exploit_cell({"isInExploitKit": "true"})
+        assert 'class="expl-chip on-k"' in cell
+        assert cell.count('class="expl-chip off"') == 2
 
-    def test_none_returns_dash(self) -> None:
-        assert report._exploit_icon({}) == "—"
+    def test_titles_are_human_readable(self) -> None:
+        cell = report._exploit_cell({"hasVerifiedExploit": "true"})
+        assert 'title="Verified exploit exists"' in cell
 
 
 # ---------------------------------------------------------------------------
@@ -125,16 +129,19 @@ class TestCveRow:
         assert 'data-patch="true"' in self._row(patchable="TRUE")
         assert 'data-patch="false"' in self._row(patchable="False")
 
-    def test_data_expl_1_when_weaponized(self) -> None:
-        assert 'data-expl="1"' in self._row(hasVerifiedExploit="true")
-
-    def test_data_expl_0_when_no_exploit(self) -> None:
-        assert 'data-expl="0"' in self._row()
+    def test_data_expl_attribute_removed(self) -> None:
+        assert 'data-expl=' not in self._row(hasVerifiedExploit="true")
 
     def test_patch_icon_matches_state(self) -> None:
         assert "✅" in self._row(patchable="true")
         assert "❌" in self._row(patchable="false")
         assert "—" in self._row(patchable="")
+
+    def test_data_v_p_k_reflect_individual_flags(self) -> None:
+        row = self._row(hasVerifiedExploit="true", isInExploitKit="true")
+        assert 'data-v="1"' in row
+        assert 'data-p="0"' in row
+        assert 'data-k="1"' in row
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +256,24 @@ class TestBuildHtmlEdgeCases:
         assert "CVE-1" in html
         assert "Vulnerable Images" in html
 
+    def test_exploit_legend_visible_by_default(self, tmp_path: Path) -> None:
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert 'class="expl-legend"' in html
+        assert "Verified exploit exists" in html
+        assert "Published exploit exists" in html
+        assert "Included in an exploit kit" in html
+        # tabs from PR-UX-1 must still be intact
+        assert 'role="tablist"' in html
+
     def test_no_crash_on_all_100_score(self, tmp_path: Path) -> None:
         """Every workload at CVSS 10.0 exercises the critical-alert path."""
         sum_rows = [
@@ -310,3 +335,18 @@ class TestBuildHtmlEdgeCases:
         assert 'id="fSearch"' in html
         assert "function applyFilters(" in html
         assert "function cpy(" in html  # copy-to-clipboard buttons unaffected
+
+    def test_exploit_filter_has_granular_options(self, tmp_path: Path) -> None:
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert '<option value="v">Verified only</option>' in html
+        assert '<option value="p">Published only</option>' in html
+        assert '<option value="k">In kit only</option>' in html

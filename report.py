@@ -15,15 +15,30 @@ from pathlib import Path
 from typing import Any
 
 
-def _exploit_icon(cve: dict[str, Any]) -> str:
-    """🔴 verified > 🟠 published > 🟡 in-kit > — none."""
-    if str(cve.get("hasVerifiedExploit", "")).lower() == "true":
-        return "🔴"
-    if str(cve.get("hasPublishedExploit", "")).lower() == "true":
-        return "🟠"
-    if str(cve.get("isInExploitKit", "")).lower() == "true":
-        return "🟡"
-    return "—"
+def _has_flag(cve: dict[str, Any], key: str) -> bool:
+    """Case-insensitive truthy check for a CSV boolean column."""
+    return str(cve.get(key, "")).lower() == "true"
+
+
+def _exploit_cell(cve: dict[str, Any]) -> str:
+    """Render the Exploit cell as 3 independent signal chips: V(erified),
+    P(ublished), K(it). Each chip is lit (colored) when its CSV flag is
+    true and dimmed otherwise, with a title/aria-label explaining the
+    signal — the meaning must not depend on hover alone (see the
+    `.expl-legend` block rendered once near the top of the page)."""
+    signals = [
+        ("v", "V", _has_flag(cve, "hasVerifiedExploit"), "Verified exploit exists"),
+        ("p", "P", _has_flag(cve, "hasPublishedExploit"), "Published exploit exists"),
+        ("k", "K", _has_flag(cve, "isInExploitKit"), "Included in an exploit kit"),
+    ]
+    chips = "".join(
+        f'<span class="expl-chip {"on-" + code if on else "off"}" '
+        f'title="{html.escape(label)}" '
+        f'aria-label="{html.escape(label)}: {"yes" if on else "no"}">'
+        f'{letter}</span>'
+        for code, letter, on, label in signals
+    )
+    return f'<td class="expl-cell">{chips}</td>'
 
 
 def _cve_row(cve: dict[str, Any]) -> str:
@@ -31,23 +46,28 @@ def _cve_row(cve: dict[str, Any]) -> str:
     Render a `<tr>` for one CVE with the data-* attributes needed by the
     client-side filters (task #18). Attributes are lowercase so JS can match
     them directly against the filter values without normalization.
+    `data-v`/`data-p`/`data-k` expose the three exploit signals
+    independently so neither the UI nor the filters collapse them into
+    one icon.
     """
     sev   = cve.get("severity", "") or ""
     patch = str(cve.get("patchable", "")).lower()
-    expl  = "1" if _is_weaponized(cve) else "0"
     pkg   = cve.get("packageName", "") or ""
     patch_icon = "✅" if patch == "true" else ("❌" if patch == "false" else "—")
+    v = "1" if _has_flag(cve, "hasVerifiedExploit") else "0"
+    p = "1" if _has_flag(cve, "hasPublishedExploit") else "0"
+    k = "1" if _has_flag(cve, "isInExploitKit") else "0"
     return (
         f'<tr data-sev="{html.escape(sev, quote=True)}" '
         f'data-patch="{html.escape(patch, quote=True)}" '
-        f'data-expl="{expl}">'
+        f'data-v="{v}" data-p="{p}" data-k="{k}">'
         f'<td class="mono">{html.escape(cve["id"])}</td>'
         f'<td>{dot(sev)}{html.escape(sev)}</td>'
         f'<td>{badge(cve["score"])}</td>'
         f'<td class="mono" style="font-size:.8em;color:#475569">{html.escape(pkg)}</td>'
         f'{_version_cell(cve)}'
         f'<td style="font-size:.8em;text-align:center">{patch_icon}</td>'
-        f'<td style="font-size:.8em;text-align:center">{_exploit_icon(cve)}</td>'
+        f'{_exploit_cell(cve)}'
         f'</tr>'
     )
 
@@ -83,10 +103,8 @@ def _new_cve_agg() -> dict[str, Any]:
 
 def _is_weaponized(cve: dict[str, Any]) -> bool:
     """True if the CVE has any exploit signal (verified, published, or in-kit)."""
-    for flag in ("hasVerifiedExploit", "hasPublishedExploit", "isInExploitKit"):
-        if str(cve.get(flag, "")).lower() == "true":
-            return True
-    return False
+    return any(_has_flag(cve, k) for k in
+               ("hasVerifiedExploit", "hasPublishedExploit", "isInExploitKit"))
 
 
 def build_image_view(namespaces: dict) -> list[dict[str, Any]]:
@@ -490,6 +508,15 @@ def build_html(namespaces):
     .copy-btn:hover{background:var(--bg);color:var(--text);border-color:var(--border-strong)}
     .copy-btn.ok{background:#D1FAE5;color:#166534;border-color:#6EE7B7}
     .copy-btn-ref{padding:2px 8px;font-size:.9em;margin-left:8px}
+    .expl-cell{text-align:center;white-space:nowrap}
+    .expl-chip{display:inline-block;width:16px;height:16px;line-height:16px;border-radius:3px;font-size:.68em;font-weight:700;margin:0 1px;color:#fff;cursor:help;text-align:center}
+    .expl-chip.off{background:var(--border);color:var(--text-3)}
+    .expl-chip.on-v{background:var(--critical)}
+    .expl-chip.on-p{background:var(--high)}
+    .expl-chip.on-k{background:var(--medium)}
+    .expl-legend{font-size:.78em;color:var(--text-2);margin:0 0 20px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+    .expl-legend strong{color:var(--text);font-size:.92em}
+    .expl-legend .expl-chip{cursor:default}
     .tbl-wrap{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
     .tbl-widespread{width:100%;border-collapse:collapse;font-size:.9em}
     .tbl-widespread thead th{padding:10px 14px;text-align:left;font-size:.68em;text-transform:uppercase;letter-spacing:.6px;color:var(--text-3);font-weight:700;background:var(--bg);border-bottom:1px solid var(--border)}
@@ -552,7 +579,10 @@ def build_html(namespaces):
     <label>Exploit
       <select id="fExpl" onchange="applyFilters()">
         <option value="">All</option>
-        <option value="1">Any exploit</option>
+        <option value="any">Any exploit</option>
+        <option value="v">Verified only</option>
+        <option value="p">Published only</option>
+        <option value="k">In kit only</option>
       </select>
     </label>
     <input type="text" id="fSearch" placeholder="Filter by namespace, repo, workload…" oninput="applyFilters()"/>
@@ -567,6 +597,13 @@ def build_html(namespaces):
     <div class="kpi-item"><span class="kpi-num">{total_e}</span><span class="kpi-label">CVE entries</span></div>
     <div class="kpi-item"><span class="{s10_cls}">{s10_count}</span><span class="kpi-label">Score 10.0</span></div>
     <div class="kpi-item"><span class="{weap_cls}">{weap_count}</span><span class="kpi-label">Weaponized</span></div>
+  </div>
+
+  <div class="expl-legend" aria-label="Exploit signal legend">
+    <strong>Exploit signals:</strong>
+    <span><span class="expl-chip on-v">V</span> Verified exploit exists</span>
+    <span><span class="expl-chip on-p">P</span> Published exploit exists</span>
+    <span><span class="expl-chip on-k">K</span> Included in an exploit kit</span>
   </div>
 
   <div class="tabs" role="tablist" aria-label="Report view">
@@ -620,7 +657,10 @@ function applyFilters(){{
     var ok=true;
     if(sev&&row.dataset.sev!==sev)ok=false;
     if(patch&&row.dataset.patch!==patch)ok=false;
-    if(expl==='1'&&row.dataset.expl!=='1')ok=false;
+    if(expl==='any'&&!(row.dataset.v==='1'||row.dataset.p==='1'||row.dataset.k==='1'))ok=false;
+    if(expl==='v'&&row.dataset.v!=='1')ok=false;
+    if(expl==='p'&&row.dataset.p!=='1')ok=false;
+    if(expl==='k'&&row.dataset.k!=='1')ok=false;
     row.style.display=ok?'':'none';
   }});
   document.querySelectorAll('.card').forEach(function(card){{
