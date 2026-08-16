@@ -130,8 +130,13 @@ def test_e2e_full_pipeline(
     # Copy button for the reference must exist with the payload as data-copy.
     assert 'class="copy-btn copy-btn-ref"' in html, "image reference copy button missing"
     assert f'data-copy="{full_ref}"' in html, "copy button payload must be repo:tag@digest"
-    # Tag is styled as a chip (destaque visual pedido pelo gestor)
-    assert 'class="img-tag"' in html, "tag chip class missing (visual highlight)"
+    # PR-UX-4: the tag no longer renders as a separate `.img-tag` chip;
+    # it now lives inline with the repo inside the unified `.img-ref-primary`
+    # line (bold, full-size), so the same visual-prominence intent is
+    # preserved without a per-tab chip class. The reference itself is
+    # canonicalised via `.img-ref` (used by both Images and OpenShift tabs).
+    assert 'class="img-ref"' in html, "unified image-reference class missing"
+    assert 'class="img-ref-primary"' in html, "image-reference primary line missing"
 
     # ---- Task #16: Weaponized KPI -----------------------------------------
     # KPI counts CVE entries that have any exploit signal.

@@ -73,6 +73,14 @@ but hidden — **Fix Status** (`FixAvailable` / `NoFix` / …) and
 under the main totals shows the Critical/High/Medium/Low breakdown at
 a glance.
 
+Container image references (`repo:tag@digest`) render via a single
+shared component (`_image_ref`) in both tabs — same font, weight, and
+size regardless of surrounding container. Layout is two lines: `repo:tag`
+on the primary line and `@sha256:…` (truncated) on the secondary line,
+with the full digest available on hover. Images without a recorded tag
+show `:(no tag)` in a muted style in both tabs (previously the OpenShift
+tab silently omitted the marker).
+
 ## Development
 
 Local test/lint tooling is wired through `make`:
