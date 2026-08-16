@@ -196,6 +196,26 @@ class TestCveTableHead:
 
 
 # ---------------------------------------------------------------------------
+# _severity_counts — per-severity KPI breakdown (PR-UX-3 Task 5)
+# ---------------------------------------------------------------------------
+
+class TestSeverityCounts:
+    def test_counts_by_severity(self) -> None:
+        cves = [
+            {"severity": "Critical"}, {"severity": "Critical"},
+            {"severity": "High"}, {"severity": "Low"},
+        ]
+        counts = report._severity_counts(cves)
+        assert counts == {"Critical": 2, "High": 1, "Low": 1}
+
+    def test_empty_list(self) -> None:
+        assert report._severity_counts([]) == {}
+
+    def test_missing_severity_bucketed_as_unknown(self) -> None:
+        assert report._severity_counts([{"severity": ""}]) == {"Unknown": 1}
+
+
+# ---------------------------------------------------------------------------
 # sev_class — score boundaries
 # ---------------------------------------------------------------------------
 

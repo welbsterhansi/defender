@@ -125,6 +125,16 @@ def _age_cell(cve: dict[str, Any]) -> str:
     return f'<td style="font-size:.8em;text-align:center">{value}</td>'
 
 
+def _severity_counts(cves: list[dict[str, Any]]) -> dict[str, int]:
+    """Count CVE entries per severity label, for the per-severity KPI
+    breakdown row (PR-UX-3 Task 5). Empty/missing severities are bucketed
+    as `"Unknown"` so the count never silently vanishes."""
+    counts: dict[str, int] = defaultdict(int)
+    for c in cves:
+        counts[c.get("severity", "") or "Unknown"] += 1
+    return dict(counts)
+
+
 def _new_cve_agg() -> dict[str, Any]:
     """defaultdict factory — explicit type keeps pyright happy about
     heterogeneous values (int/float/list) stored under the same dict."""
@@ -201,6 +211,8 @@ IC = {
     "activity": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
 }
 
+SEV_COLORS = {"Critical": "#EF4444", "High": "#F97316", "Medium": "#EAB308", "Low": "#22C55E"}
+
 def ic(name, size=15, color="currentColor"):
     return svg(IC[name], size=size, color=color)
 
@@ -218,7 +230,7 @@ def badge(score):
     return f'<span class="badge {sev_class(score)}">{score}</span>'
 
 def dot(severity):
-    c = {"Critical":"#EF4444","High":"#F97316","Medium":"#EAB308","Low":"#22C55E"}.get(severity,"#94A3B8")
+    c = SEV_COLORS.get(severity, "#94A3B8")
     return f'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{c};margin-right:5px;vertical-align:middle"></span>'
 
 def wbadge(wtype):
@@ -297,6 +309,13 @@ def build_html(namespaces):
     s10_count    = len(score10)
     # Weaponized = any CVE entry with a known exploit (verified > published > kit).
     weap_count   = sum(1 for c in all_cves if _is_weaponized(c))
+    # PR-UX-3 Task 5 — per-severity breakdown; drives the second KPI strip.
+    sev_counts = _severity_counts(all_cves)
+    sev_kpi_html = "".join(
+        f'<div class="kpi-item"><span class="kpi-num" style="color:{SEV_COLORS[sev]}">'
+        f'{sev_counts.get(sev, 0)}</span><span class="kpi-label">{sev}</span></div>'
+        for sev in ("Critical", "High", "Medium", "Low")
+    )
 
     # ── Alert bar ── only when there's something that demands action NOW.
     # This is the single "you cannot ignore this" element; kept sticky in CSS.
@@ -544,6 +563,8 @@ def build_html(namespaces):
     .expl-chip.on-v{background:var(--critical)}
     .expl-chip.on-p{background:var(--high)}
     .expl-chip.on-k{background:var(--medium)}
+    .kpi-strip-sev{margin-top:-24px}
+    .kpi-strip-sev .kpi-num{font-size:1.3em}
     .expl-legend{font-size:.78em;color:var(--text-2);margin:0 0 20px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;gap:16px;flex-wrap:wrap;align-items:center}
     .expl-legend strong{color:var(--text);font-size:.92em}
     .expl-legend .expl-chip{cursor:default}
@@ -627,6 +648,10 @@ def build_html(namespaces):
     <div class="kpi-item"><span class="kpi-num">{total_e}</span><span class="kpi-label">CVE entries</span></div>
     <div class="kpi-item"><span class="{s10_cls}">{s10_count}</span><span class="kpi-label">Score 10.0</span></div>
     <div class="kpi-item"><span class="{weap_cls}">{weap_count}</span><span class="kpi-label">Weaponized</span></div>
+  </div>
+
+  <div class="kpi-strip kpi-strip-sev">
+    {sev_kpi_html}
   </div>
 
   <div class="expl-legend" aria-label="Exploit signal legend">
