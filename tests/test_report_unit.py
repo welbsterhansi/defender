@@ -272,3 +272,41 @@ class TestBuildHtmlEdgeCases:
         assert "CVSS 10.0" in html
         # Score 10.0 KPI should render with the `critical` red variant.
         assert 'class="kpi-num critical"' in html
+
+    def test_tabs_present_with_source_labels(self, tmp_path: Path) -> None:
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert 'role="tablist"' in html
+        assert 'id="tab-images"' in html
+        assert 'id="tab-cluster"' in html
+        assert "Azure Container Registry" in html
+        assert "OpenShift Cluster" in html
+        assert "function switchTab(" in html
+
+    def test_existing_filters_still_present(self, tmp_path: Path) -> None:
+        """Regression guard: tabs must not remove the severity/patch/exploit/
+        search filter bar or its onchange wiring."""
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert 'id="fSev"' in html
+        assert 'id="fPatch"' in html
+        assert 'id="fExpl"' in html
+        assert 'id="fSearch"' in html
+        assert "function applyFilters(" in html
+        assert "function cpy(" in html  # copy-to-clipboard buttons unaffected
