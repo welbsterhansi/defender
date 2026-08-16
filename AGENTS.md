@@ -89,6 +89,7 @@ python3 report.py
 | `--scan-image <ref>`  | Scan a specific repo, tag, or digest |
 | `--repository <r>`    | **Broad** substring filter (uses `contains`) — single repo. `app` will match `app-backend` and `myapp`. |
 | `--repositories <l>`  | **Controlled** exact list (comma-separated). Each entry must exist exactly in the ACR; empty entries or duplicates abort. `app` does NOT capture `app-backend`. Mutually exclusive with `--repository` and `--scan-image`. |
+| `--skip-tags`         | Bypass the tag_resolve phase entirely. Zero `show-tags` calls, every CSV row has `tag="N/A"`. Escape hatch for large scans where CVE data is all that matters. Incompatible with `--scan-image`. |
 | `--dry-run`           | Print commands without executing |
 | `--auto-approve`      | Skip interactive confirmation |
 | `--debug`             | Print the generated KQL and run a diagnostic ARG query |

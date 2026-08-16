@@ -80,10 +80,16 @@ def _make_fake_az_returning(
         safe = repo.replace("/", "__")
         (tags_dir / f"{safe}.fail").write_text("", encoding="utf-8")
 
+    known_repos = "\n".join(sorted(repo_tags.keys()))
     body = f"""#!/usr/bin/env bash
 echo "$*" >> "{bin_dir.parent}/az_calls.log"
 if [ "$1 $2" = "acr show" ]; then exit 0; fi
-if [ "$1 $2 $3" = "acr repository list" ]; then exit 0; fi
+if [ "$1 $2 $3" = "acr repository list" ]; then
+    cat <<'REPOS_EOF'
+{known_repos}
+REPOS_EOF
+    exit 0
+fi
 if [ "$1 $2 $3" = "acr repository show-tags" ]; then
     repo=""
     shift 3
@@ -143,6 +149,7 @@ def _run_defender(
     *,
     repo_tags: dict[str, list[dict]] | None = None,
     failing_repos: set[str] | None = None,
+    extra_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     fake_root = _make_fake_az_returning(
         tmp_path / "bin", graph_pages,
@@ -150,9 +157,13 @@ def _run_defender(
     )
     env = os.environ.copy()
     env["PATH"] = f"{fake_root / 'bin'}:{env['PATH']}"
+    argv = [str(DEFENDER), "--acr-name", "benchmark",
+            "--min-score", "0", "--max-score", "10"]
+    if extra_args:
+        argv.extend(extra_args)
     return subprocess.run(
-        [str(DEFENDER), "--acr-name", "benchmark", "--min-score", "0", "--max-score", "10"],
-        cwd=tmp_path, env=env, capture_output=True, text=True, check=False,
+        argv, cwd=tmp_path, env=env,
+        capture_output=True, text=True, check=False,
     )
 
 
@@ -445,6 +456,119 @@ class TestPrbTagCachePerRepo:
 
         by_digest = self._read_csv_by_digest(tmp_path)
         assert by_digest[digest]["tag"] == "match"
+
+
+class TestPrcSkipTagsFlag:
+    """PR-C: `--skip-tags` bypasses phase 2 entirely. TAG_CACHE stays empty
+    and every CSV row falls back to `tag="N/A"` via the phase-3 default.
+    Timing fields still emit (as 0) so dashboards/benchmarks keep parsing
+    the log line."""
+
+    def _read_csv_by_digest(self, tmp_path: Path) -> dict[str, dict[str, str]]:
+        csv = (tmp_path / "vulnerable_images_report.csv").read_text(encoding="utf-8")
+        rows = list(csv_module.reader(io.StringIO(csv)))
+        header, data_rows = rows[0], rows[1:]
+        return {
+            dict(zip(header, r, strict=True))["digest"]:
+                dict(zip(header, r, strict=True))
+            for r in data_rows
+        }
+
+    def test_zero_show_tags_calls_and_all_na(self, tmp_path: Path) -> None:
+        pages = [{"data": [
+            _row("a" * 64, repo="repo-alpha"),
+            _row("b" * 64, repo="repo-alpha"),
+            _row("c" * 64, repo="repo-beta"),
+        ], "skip_token": ""}]
+        r = _run_defender(tmp_path, pages, extra_args=["--skip-tags"])
+        assert r.returncode == 0, r.stderr
+
+        assert _count_show_tags(tmp_path) == 0
+        by_digest = self._read_csv_by_digest(tmp_path)
+        assert len(by_digest) == 3
+        for row in by_digest.values():
+            assert row["tag"] == "N/A", row
+
+    def test_timing_line_reports_zero_for_tag_fields(self, tmp_path: Path) -> None:
+        # Two pages — every timing line must have tag_api_calls=0 and
+        # tag_resolve:0. The log format itself must not change.
+        pages = [
+            {"data": [_row("a" * 64, repo="r1")], "skip_token": "cursor-1"},
+            {"data": [_row("b" * 64, repo="r2")], "skip_token": ""},
+        ]
+        r = _run_defender(tmp_path, pages, extra_args=["--skip-tags"])
+        assert r.returncode == 0, r.stderr
+
+        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
+        matches = [TIMING_LINE_RE.search(line) for line in log.splitlines()]
+        matches = [m for m in matches if m is not None]
+        assert len(matches) == 2, matches
+        for m in matches:
+            assert m["tag_calls"] == "0", m.group(0)
+            assert m["tags"] == "0", m.group(0)
+
+    def test_skip_tags_composes_with_repository_filter(self, tmp_path: Path) -> None:
+        # --skip-tags is orthogonal to --repository. Filter still applies,
+        # tags still empty. The KQL contains-filter is server-side so the
+        # fake az returns whatever the test supplies — we just assert the
+        # combination doesn't error and the flag semantics hold.
+        pages = [{"data": [_row("a" * 64, repo="myapp")], "skip_token": ""}]
+        r = _run_defender(
+            tmp_path, pages,
+            extra_args=["--skip-tags", "--repository", "myapp"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _count_show_tags(tmp_path) == 0
+        by_digest = self._read_csv_by_digest(tmp_path)
+        assert by_digest["sha256:" + "a" * 64]["tag"] == "N/A"
+
+    def test_skip_tags_incompatible_with_scan_image(self, tmp_path: Path) -> None:
+        # --scan-image resolves tag → digest up front; combining with
+        # --skip-tags is contradictory. Must exit 2 with a clear message
+        # BEFORE any az graph query call. We craft a minimal fake that
+        # would succeed if reached, then confirm we never reached it.
+        r = _run_defender(
+            tmp_path, [{"data": [], "skip_token": ""}],
+            extra_args=["--skip-tags", "--scan-image", "myapp"],
+        )
+        assert r.returncode == 2, r.stderr
+        assert "incompatible" in r.stderr.lower() or "incompatible" in r.stdout.lower()
+
+        # Fake az must not have been called for graph query / show-tags —
+        # az_calls.log may not exist if we exited before any call, or it
+        # exists but contains no relevant lines.
+        log_file = tmp_path / "az_calls.log"
+        if log_file.exists():
+            log = log_file.read_text(encoding="utf-8")
+            assert "graph query" not in log
+            assert "show-tags"   not in log
+
+    def test_skip_tags_appears_in_log_header(self, tmp_path: Path) -> None:
+        # Reviewer nit: init_logging must reflect --skip-tags in the header
+        # args, not only in the follow-up INFO line, so the audit trail is
+        # self-contained.
+        pages = [{"data": [_row("a" * 64, repo="repo-alpha")], "skip_token": ""}]
+        r = _run_defender(tmp_path, pages, extra_args=["--skip-tags"])
+        assert r.returncode == 0, r.stderr
+
+        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
+        # init_logging emits an "args:" header line. We only assert the flag
+        # appears in the first few lines (header block), not anywhere in the
+        # body (INFO log lines come later).
+        header = "\n".join(log.splitlines()[:12])
+        assert "--skip-tags" in header, header
+
+    def test_default_still_resolves_tags_regression_guard(
+        self, tmp_path: Path
+    ) -> None:
+        # Without --skip-tags, PR-B behavior is preserved: at least one
+        # show-tags call and TAG populated from fake response.
+        pages = [{"data": [_row("a" * 64, repo="myapp")], "skip_token": ""}]
+        r = _run_defender(tmp_path, pages)
+        assert r.returncode == 0, r.stderr
+        assert _count_show_tags(tmp_path) >= 1
+        by_digest = self._read_csv_by_digest(tmp_path)
+        assert by_digest["sha256:" + "a" * 64]["tag"] != "N/A"
 
 
 class TestJqCleanBehavior:
