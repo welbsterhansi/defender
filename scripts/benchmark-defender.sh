@@ -126,8 +126,11 @@ case "\$1 \$2 \$3" in
         echo '[]'
         exit 0 ;;
     "acr repository show-tags")
-        # Benchmark cares about call count and latency, not tag identity.
-        echo "v1.0"
+        # PR-B: defender.sh now parses show-tags as a JSON array of
+        # {name, digest} objects (--detail --output json). Emit an empty
+        # array — the benchmark cares about call count and latency, not
+        # tag identity. All digests will fall back to TAG=N/A in the CSV.
+        echo '[]'
         exit 0 ;;
 esac
 exit 0

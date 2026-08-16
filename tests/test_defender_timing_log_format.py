@@ -33,23 +33,73 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_fake_az_returning(bin_dir: Path, graph_pages: list[dict]) -> Path:
+def _make_fake_az_returning(
+    bin_dir: Path,
+    graph_pages: list[dict],
+    *,
+    repo_tags: dict[str, list[dict]] | None = None,
+    failing_repos: set[str] | None = None,
+) -> Path:
     """
     Fake `az` that returns `graph_pages[i]` on the (i+1)-th `graph query`
     invocation, then empty {"data":[]} on subsequent calls. Logs every
     invocation to `<bin_dir>/../az_calls.log` for count assertions.
+
+    show-tags behavior (PR-B):
+      - Returns a JSON array of {name, digest} objects matching the shape
+        of `az acr repository show-tags --detail --output json`.
+      - `repo_tags` overrides the response per repository. If omitted, one
+        synthetic tag (tag-1, tag-2, ...) is auto-generated per unique
+        digest seen in `graph_pages` for that repository — enough for
+        default tests where we only care about counts.
+      - `failing_repos` — set of repos for which `az` will exit 1 (used
+        by the failure-handling tests).
     """
     bin_dir.mkdir(parents=True, exist_ok=True)
     payloads_dir = bin_dir.parent / "payloads"
+    tags_dir = bin_dir.parent / "tags"
     payloads_dir.mkdir(exist_ok=True)
+    tags_dir.mkdir(exist_ok=True)
     for i, page in enumerate(graph_pages, start=1):
         (payloads_dir / f"page{i}.json").write_text(json.dumps(page), encoding="utf-8")
+
+    if repo_tags is None:
+        repo_tags = {}
+        for page in graph_pages:
+            for row in page.get("data", []):
+                r = row["repository"]
+                d = row["digest"]
+                bucket = repo_tags.setdefault(r, [])
+                if not any(t["digest"] == d for t in bucket):
+                    bucket.append({"name": f"tag-{len(bucket) + 1}", "digest": d})
+    for repo, tags in repo_tags.items():
+        safe = repo.replace("/", "__")
+        (tags_dir / f"{safe}.json").write_text(json.dumps(tags), encoding="utf-8")
+
+    for repo in failing_repos or set():
+        safe = repo.replace("/", "__")
+        (tags_dir / f"{safe}.fail").write_text("", encoding="utf-8")
 
     body = f"""#!/usr/bin/env bash
 echo "$*" >> "{bin_dir.parent}/az_calls.log"
 if [ "$1 $2" = "acr show" ]; then exit 0; fi
 if [ "$1 $2 $3" = "acr repository list" ]; then exit 0; fi
-if [ "$1 $2 $3" = "acr repository show-tags" ]; then echo "v1.0"; exit 0; fi
+if [ "$1 $2 $3" = "acr repository show-tags" ]; then
+    repo=""
+    shift 3
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repository) repo="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    safe="${{repo//\\//__}}"
+    if [ -f "{tags_dir}/${{safe}}.fail" ]; then exit 1; fi
+    if [ -f "{tags_dir}/${{safe}}.json" ]; then
+        cat "{tags_dir}/${{safe}}.json"; exit 0
+    fi
+    echo '[]'; exit 0
+fi
 if [ "$1 $2" = "graph query" ]; then
     ctr="{bin_dir.parent}/page_counter"
     prev=$(cat "$ctr" 2>/dev/null || echo 0)
@@ -87,8 +137,17 @@ def _row(digest_hex: str, cve: str = "CVE-1", repo: str = "myapp") -> dict:
     }
 
 
-def _run_defender(tmp_path: Path, graph_pages: list[dict]) -> subprocess.CompletedProcess:
-    fake_root = _make_fake_az_returning(tmp_path / "bin", graph_pages)
+def _run_defender(
+    tmp_path: Path,
+    graph_pages: list[dict],
+    *,
+    repo_tags: dict[str, list[dict]] | None = None,
+    failing_repos: set[str] | None = None,
+) -> subprocess.CompletedProcess:
+    fake_root = _make_fake_az_returning(
+        tmp_path / "bin", graph_pages,
+        repo_tags=repo_tags, failing_repos=failing_repos,
+    )
     env = os.environ.copy()
     env["PATH"] = f"{fake_root / 'bin'}:{env['PATH']}"
     return subprocess.run(
@@ -165,35 +224,43 @@ class TestTimingLogFormat:
         assert "batch=0" in log or "batch=0" in r.stdout
 
 
-class TestTagApiCallsCounter:
-    """Baseline behavior: 1 call per unique (repo, digest) tuple in the page.
-    PR-B will change this to 1 call per repo — the test will be updated then."""
+def _count_show_tags(tmp_path: Path) -> int:
+    log = (tmp_path / "az_calls.log").read_text(encoding="utf-8")
+    return sum(1 for line in log.splitlines() if "acr repository show-tags" in line)
 
-    def test_counter_matches_unique_digests(self, tmp_path: Path) -> None:
-        # 3 rows, 3 distinct digests → 3 show-tags calls expected.
+
+class TestTagApiCallsCounter:
+    """PR-B semantics: `tag_api_calls` on the per-page timing line counts
+    actual `az show-tags` invocations made on that page. Cache is
+    execution-global, so a repo already resolved on an earlier page does
+    NOT increment the counter on later pages."""
+
+    def test_counter_matches_show_tags_invocations(self, tmp_path: Path) -> None:
+        # 3 rows, 3 distinct digests, all in the SAME repo → 1 call.
         pages = [{"data": [
-            _row("a" * 64), _row("b" * 64), _row("c" * 64),
+            _row("a" * 64, repo="repo-alpha"),
+            _row("b" * 64, repo="repo-alpha"),
+            _row("c" * 64, repo="repo-alpha"),
+        ], "skip_token": ""}]
+        _run_defender(tmp_path, pages)
+
+        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
+        m = _first_timing_match(log)
+        assert m is not None
+        assert int(m["tag_calls"]) == _count_show_tags(tmp_path) == 1
+
+    def test_counter_matches_unique_repos_not_digests(self, tmp_path: Path) -> None:
+        # 3 rows across 2 repos → 2 calls (one per repo).
+        pages = [{"data": [
+            _row("a" * 64, repo="repo-alpha"),
+            _row("b" * 64, repo="repo-alpha"),
+            _row("c" * 64, repo="repo-beta"),
         ], "skip_token": ""}]
         _run_defender(tmp_path, pages)
         log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
         m = _first_timing_match(log)
         assert m is not None
-        assert m["tag_calls"] == "3"
-
-    def test_counter_matches_az_calls(self, tmp_path: Path) -> None:
-        """The counter defender.sh reports must match the number of
-        `show-tags` invocations the fake az actually observed."""
-        pages = [{"data": [_row("a" * 64), _row("b" * 64)], "skip_token": ""}]
-        _run_defender(tmp_path, pages)
-
-        az_calls = (tmp_path / "az_calls.log").read_text(encoding="utf-8")
-        actual_show_tags = sum(
-            1 for line in az_calls.splitlines() if "acr repository show-tags" in line
-        )
-        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
-        m = _first_timing_match(log)
-        assert m is not None
-        assert int(m["tag_calls"]) == actual_show_tags
+        assert int(m["tag_calls"]) == _count_show_tags(tmp_path) == 2
 
 
 class TestCsvOutputUnchanged:
@@ -224,6 +291,160 @@ class TestCsvOutputUnchanged:
         assert lines[1].startswith('"myrepo","sha256:'), lines[1]
         # Every value quoted (csv_write_row invariant).
         assert lines[1].count('"') == 38  # 19 fields × 2 quotes
+
+
+class TestPrbTagCachePerRepo:
+    """PR-B: `az show-tags --detail` returns ALL tags of a repo in one call.
+    The cache is now keyed per repository (not per digest), and lives for
+    the whole execution (not per page). These tests lock the acceptance
+    criteria the reviewer set on PR-B:
+
+      - N digests in one repo → 1 call to show-tags
+      - N repos → N calls
+      - Same repo across pages → 1 call total (execution-global cache)
+      - show-tags failure → digests of that repo → TAG=N/A, 1 WARN per
+        repo (no retry on later pages), scan continues (exit 0)
+      - CSV preserves TAG when the show-tags response includes the digest
+      - First-tag-wins for digests that carry multiple tags (matches the
+        prior `[?digest=='X'].name | [0]` semantics)
+      - Truncation guard: response with exactly 5000 entries logs a WARN
+    """
+
+    def _read_csv_by_digest(self, tmp_path: Path) -> dict[str, dict[str, str]]:
+        csv = (tmp_path / "vulnerable_images_report.csv").read_text(encoding="utf-8")
+        rows = list(csv_module.reader(io.StringIO(csv)))
+        header, data_rows = rows[0], rows[1:]
+        return {
+            dict(zip(header, r, strict=True))["digest"]:
+                dict(zip(header, r, strict=True))
+            for r in data_rows
+        }
+
+    def test_multiple_digests_same_repo_makes_one_call(
+        self, tmp_path: Path
+    ) -> None:
+        pages = [{"data": [
+            _row("a" * 64, repo="repo-alpha"),
+            _row("b" * 64, repo="repo-alpha"),
+        ], "skip_token": ""}]
+        r = _run_defender(tmp_path, pages)
+        assert r.returncode == 0, r.stderr
+        assert _count_show_tags(tmp_path) == 1
+
+    def test_multiple_repos_make_one_call_each(self, tmp_path: Path) -> None:
+        pages = [{"data": [
+            _row("a" * 64, repo="repo-alpha"),
+            _row("b" * 64, repo="repo-beta"),
+            _row("c" * 64, repo="repo-gamma"),
+        ], "skip_token": ""}]
+        r = _run_defender(tmp_path, pages)
+        assert r.returncode == 0, r.stderr
+        assert _count_show_tags(tmp_path) == 3
+
+    def test_same_repo_across_pages_makes_one_call(self, tmp_path: Path) -> None:
+        pages = [
+            {"data": [_row("a" * 64, repo="repo-alpha")],
+             "skip_token": "cursor-1"},
+            {"data": [_row("b" * 64, repo="repo-alpha")],
+             "skip_token": ""},
+        ]
+        r = _run_defender(tmp_path, pages)
+        assert r.returncode == 0, r.stderr
+        # execution-global cache: second page reuses page-1 tag data.
+        assert _count_show_tags(tmp_path) == 1
+
+        # Per-page counter reports 0 on the second page (no new az calls).
+        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
+        matches = [TIMING_LINE_RE.search(line) for line in log.splitlines()]
+        matches = [m for m in matches if m is not None]
+        assert len(matches) == 2, matches
+        assert int(matches[0]["tag_calls"]) == 1
+        assert int(matches[1]["tag_calls"]) == 0
+
+    def test_show_tags_failure_yields_na_and_warns_once(
+        self, tmp_path: Path
+    ) -> None:
+        # 2 pages, same failing repo — WARN must fire exactly once, both
+        # digests fall back to TAG=N/A, exit 0.
+        pages = [
+            {"data": [_row("a" * 64, repo="repo-broken")],
+             "skip_token": "cursor-1"},
+            {"data": [_row("b" * 64, repo="repo-broken")],
+             "skip_token": ""},
+        ]
+        r = _run_defender(tmp_path, pages, failing_repos={"repo-broken"})
+        assert r.returncode == 0, r.stderr
+
+        by_digest = self._read_csv_by_digest(tmp_path)
+        assert by_digest["sha256:" + "a" * 64]["tag"] == "N/A"
+        assert by_digest["sha256:" + "b" * 64]["tag"] == "N/A"
+
+        # az was called once for the failing repo — not retried on page 2.
+        assert _count_show_tags(tmp_path) == 1
+
+        # WARN appears exactly once for that repo.
+        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
+        warns = [
+            line for line in log.splitlines()
+            if "show-tags failed" in line and "repo-broken" in line
+        ]
+        assert len(warns) == 1, warns
+
+    def test_csv_preserves_tag_when_found(self, tmp_path: Path) -> None:
+        pages = [{"data": [
+            _row("a" * 64, repo="repo-alpha"),
+            _row("b" * 64, repo="repo-alpha"),
+        ], "skip_token": ""}]
+        repo_tags = {"repo-alpha": [
+            {"name": "release-1.0", "digest": "sha256:" + "a" * 64},
+            {"name": "release-2.0", "digest": "sha256:" + "b" * 64},
+        ]}
+        r = _run_defender(tmp_path, pages, repo_tags=repo_tags)
+        assert r.returncode == 0, r.stderr
+
+        by_digest = self._read_csv_by_digest(tmp_path)
+        assert by_digest["sha256:" + "a" * 64]["tag"] == "release-1.0"
+        assert by_digest["sha256:" + "b" * 64]["tag"] == "release-2.0"
+
+    def test_first_tag_wins_for_duplicate_digest(self, tmp_path: Path) -> None:
+        # Two tags point at the same digest. Prior code used
+        # `[?digest=='X'].name | [0]` → array-order-first. The per-repo
+        # map must preserve that: first tag in the show-tags response wins.
+        digest = "sha256:" + "a" * 64
+        pages = [{"data": [_row("a" * 64, repo="repo-alpha")], "skip_token": ""}]
+        repo_tags = {"repo-alpha": [
+            {"name": "v1.0",           "digest": digest},
+            {"name": "v1.0-hotfix",    "digest": digest},
+        ]}
+        r = _run_defender(tmp_path, pages, repo_tags=repo_tags)
+        assert r.returncode == 0, r.stderr
+
+        by_digest = self._read_csv_by_digest(tmp_path)
+        assert by_digest[digest]["tag"] == "v1.0", (
+            "expected first-tag-wins semantics; got last-tag-wins"
+        )
+
+    def test_show_tags_truncation_warns_at_5000(self, tmp_path: Path) -> None:
+        # Craft exactly 5000 tag entries; only one digest overlaps with the
+        # scanned row so we can also confirm the found digest still resolves.
+        digest = "sha256:" + "a" * 64
+        tags = [{"name": f"tag-{i}", "digest": f"sha256:{i:064x}"}
+                for i in range(4999)]
+        tags.append({"name": "match", "digest": digest})
+        assert len(tags) == 5000
+        pages = [{"data": [_row("a" * 64, repo="repo-huge")], "skip_token": ""}]
+        r = _run_defender(tmp_path, pages, repo_tags={"repo-huge": tags})
+        assert r.returncode == 0, r.stderr
+
+        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
+        warns = [
+            line for line in log.splitlines()
+            if "returned exactly 5000" in line and "repo-huge" in line
+        ]
+        assert len(warns) == 1, warns
+
+        by_digest = self._read_csv_by_digest(tmp_path)
+        assert by_digest[digest]["tag"] == "match"
 
 
 class TestJqCleanBehavior:
