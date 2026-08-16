@@ -143,6 +143,82 @@ class TestCveRow:
         assert 'data-p="0"' in row
         assert 'data-k="1"' in row
 
+    def test_fix_status_and_age_included_in_row(self) -> None:
+        row = self._row(fixStatus="NoFix", cveAgeDays="120")
+        assert "NoFix" in row
+        assert ">120<" in row
+
+    def test_patch_cell_has_aria_label(self) -> None:
+        assert 'aria-label="Patchable"' in self._row(patchable="true")
+        assert 'aria-label="Not patchable"' in self._row(patchable="false")
+        assert 'aria-label="Patch status unknown"' in self._row(patchable="")
+
+
+# ---------------------------------------------------------------------------
+# _fix_status_cell — Fix Status column (PR-UX-3 Task 4)
+# ---------------------------------------------------------------------------
+
+class TestFixStatusCell:
+    def test_renders_value(self) -> None:
+        assert "FixAvailable" in report._fix_status_cell({"fixStatus": "FixAvailable"})
+
+    def test_missing_value_shows_dash(self) -> None:
+        assert ">—<" in report._fix_status_cell({})
+
+    def test_html_escaped(self) -> None:
+        cell = report._fix_status_cell({"fixStatus": "<b>x</b>"})
+        assert "<b>" not in cell
+        assert "&lt;b&gt;" in cell
+
+
+# ---------------------------------------------------------------------------
+# _age_cell — CVE age (days) column (PR-UX-3 Task 4)
+# ---------------------------------------------------------------------------
+
+class TestAgeCell:
+    def test_renders_value(self) -> None:
+        assert ">45<" in report._age_cell({"cveAgeDays": "45"})
+
+    def test_missing_value_shows_dash(self) -> None:
+        assert ">—<" in report._age_cell({"cveAgeDays": ""})
+
+    def test_zero_is_not_treated_as_missing(self) -> None:
+        # `cveAgeDays="0"` is a real value (today), not missing — only
+        # whitespace/empty counts as missing.
+        assert ">0<" in report._age_cell({"cveAgeDays": "0"})
+
+
+# ---------------------------------------------------------------------------
+# _cve_table_head — deduped <thead> for both image and workload cards
+# ---------------------------------------------------------------------------
+
+class TestCveTableHead:
+    def test_columns_include_fix_status_and_age(self) -> None:
+        head = report._cve_table_head()
+        assert "<th>Fix Status</th>" in head
+        assert "<th>Age (days)</th>" in head
+        assert "<th>Exploit</th>" in head
+
+
+# ---------------------------------------------------------------------------
+# _severity_counts — per-severity KPI breakdown (PR-UX-3 Task 5)
+# ---------------------------------------------------------------------------
+
+class TestSeverityCounts:
+    def test_counts_by_severity(self) -> None:
+        cves = [
+            {"severity": "Critical"}, {"severity": "Critical"},
+            {"severity": "High"}, {"severity": "Low"},
+        ]
+        counts = report._severity_counts(cves)
+        assert counts == {"Critical": 2, "High": 1, "Low": 1}
+
+    def test_empty_list(self) -> None:
+        assert report._severity_counts([]) == {}
+
+    def test_missing_severity_bucketed_as_unknown(self) -> None:
+        assert report._severity_counts([{"severity": ""}]) == {"Unknown": 1}
+
 
 # ---------------------------------------------------------------------------
 # sev_class — score boundaries
@@ -255,6 +331,40 @@ class TestBuildHtmlEdgeCases:
         html = report.build_html(ns)
         assert "CVE-1" in html
         assert "Vulnerable Images" in html
+
+    def test_full_digest_available_via_title(self, tmp_path: Path) -> None:
+        # PR-UX-3 Task 6: the truncated `@digest_short` shown in image and
+        # workload cards must expose the FULL sha256 via a `title=` tooltip
+        # so devs can copy/inspect it without regenerating the report.
+        digest = "sha256:" + "a" * 64
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", digest, "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", digest, "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert f'title="{digest}"' in html
+
+    def test_visible_counter_format(self, tmp_path: Path) -> None:
+        # PR-UX-3 Task 6: `applyFilters()` must now count `.card`s scoped to
+        # the ACTIVE `.tab-panel` so the "N of M visible" text reflects
+        # what the user is currently looking at, not the sum of both tabs.
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert "activePanel" in html
+        assert "totalCards" in html
 
     def test_exploit_legend_visible_by_default(self, tmp_path: Path) -> None:
         sum_p, exp_p = self._minimal_csvs(

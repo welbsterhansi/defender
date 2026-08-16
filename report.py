@@ -54,6 +54,9 @@ def _cve_row(cve: dict[str, Any]) -> str:
     patch = str(cve.get("patchable", "")).lower()
     pkg   = cve.get("packageName", "") or ""
     patch_icon = "✅" if patch == "true" else ("❌" if patch == "false" else "—")
+    patch_label = ("Patchable" if patch == "true"
+                   else "Not patchable" if patch == "false"
+                   else "Patch status unknown")
     v = "1" if _has_flag(cve, "hasVerifiedExploit") else "0"
     p = "1" if _has_flag(cve, "hasPublishedExploit") else "0"
     k = "1" if _has_flag(cve, "isInExploitKit") else "0"
@@ -66,7 +69,9 @@ def _cve_row(cve: dict[str, Any]) -> str:
         f'<td>{badge(cve["score"])}</td>'
         f'<td class="mono" style="font-size:.8em;color:#475569">{html.escape(pkg)}</td>'
         f'{_version_cell(cve)}'
-        f'<td style="font-size:.8em;text-align:center">{patch_icon}</td>'
+        f'<td style="font-size:.8em;text-align:center" aria-label="{patch_label}">{patch_icon}</td>'
+        f'{_fix_status_cell(cve)}'
+        f'{_age_cell(cve)}'
         f'{_exploit_cell(cve)}'
         f'</tr>'
     )
@@ -93,6 +98,44 @@ def _version_cell(cve: dict[str, Any]) -> str:
         f'title="Copy `{payload_attr}`">⧉</button>'
         f'</td>'
     )
+
+
+def _cve_table_head() -> str:
+    """Shared `<thead>` for both the image-view and namespace-view CVE
+    tables — keeps the two render paths from drifting out of sync when
+    columns are added or reordered (PR-UX-3 Task 4)."""
+    cols = ["CVE ID", "Severity", "Score", "Package", "Current → Fixed",
+            "Patch", "Fix Status", "Age (days)", "Exploit"]
+    ths = "".join(f"<th>{c}</th>" for c in cols)
+    return f"<thead><tr>{ths}</tr></thead>"
+
+
+def _fix_status_cell(cve: dict[str, Any]) -> str:
+    """Render the Fix Status cell, defaulting to em-dash when absent.
+    Value comes straight from Defender's `fixStatus` field (already in
+    the CSV, previously loaded but never surfaced in the report)."""
+    value = html.escape(str(cve.get("fixStatus", "") or "—"))
+    return f'<td style="font-size:.8em;text-align:center">{value}</td>'
+
+
+def _age_cell(cve: dict[str, Any]) -> str:
+    """Render the CVE age-in-days cell, defaulting to em-dash when absent.
+    `cveAgeDays="0"` is a real value (found today), not a missing one —
+    only an empty/whitespace string counts as missing so freshly-published
+    CVEs are visibly distinguished from ones we have no age data for."""
+    age_raw = str(cve.get("cveAgeDays", "") or "").strip()
+    value = html.escape(age_raw) if age_raw else "—"
+    return f'<td style="font-size:.8em;text-align:center">{value}</td>'
+
+
+def _severity_counts(cves: list[dict[str, Any]]) -> dict[str, int]:
+    """Count CVE entries per severity label, for the per-severity KPI
+    breakdown row (PR-UX-3 Task 5). Empty/missing severities are bucketed
+    as `"Unknown"` so the count never silently vanishes."""
+    counts: dict[str, int] = defaultdict(int)
+    for c in cves:
+        counts[c.get("severity", "") or "Unknown"] += 1
+    return dict(counts)
 
 
 def _new_cve_agg() -> dict[str, Any]:
@@ -171,6 +214,8 @@ IC = {
     "activity": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
 }
 
+SEV_COLORS = {"Critical": "#EF4444", "High": "#F97316", "Medium": "#EAB308", "Low": "#22C55E"}
+
 def ic(name, size=15, color="currentColor"):
     return svg(IC[name], size=size, color=color)
 
@@ -188,7 +233,7 @@ def badge(score):
     return f'<span class="badge {sev_class(score)}">{score}</span>'
 
 def dot(severity):
-    c = {"Critical":"#EF4444","High":"#F97316","Medium":"#EAB308","Low":"#22C55E"}.get(severity,"#94A3B8")
+    c = SEV_COLORS.get(severity, "#94A3B8")
     return f'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{c};margin-right:5px;vertical-align:middle"></span>'
 
 def wbadge(wtype):
@@ -267,6 +312,13 @@ def build_html(namespaces):
     s10_count    = len(score10)
     # Weaponized = any CVE entry with a known exploit (verified > published > kit).
     weap_count   = sum(1 for c in all_cves if _is_weaponized(c))
+    # PR-UX-3 Task 5 — per-severity breakdown; drives the second KPI strip.
+    sev_counts = _severity_counts(all_cves)
+    sev_kpi_html = "".join(
+        f'<div class="kpi-item"><span class="kpi-num" style="color:{SEV_COLORS[sev]}">'
+        f'{sev_counts.get(sev, 0)}</span><span class="kpi-label">{sev}</span></div>'
+        for sev in ("Critical", "High", "Medium", "Low")
+    )
 
     # ── Alert bar ── only when there's something that demands action NOW.
     # This is the single "you cannot ignore this" element; kept sticky in CSS.
@@ -318,7 +370,7 @@ def build_html(namespaces):
           <button class="card-btn" onclick="toggle(this)">
             <div class="card-left">
               <span class="img-ref mono">
-                <span class="img-repo">{html.escape(repo)}</span>{tag_html_span}<span class="img-digest">@{digest_short}</span>
+                <span class="img-repo">{html.escape(repo)}</span>{tag_html_span}<span class="img-digest" title="{html.escape(digest, quote=True)}">@{digest_short}</span>
               </span>
               <button class="copy-btn copy-btn-ref" data-copy="{full_ref_attr}" onclick="cpy(this)" title="Copy {full_ref_attr}">⧉</button>
             </div>
@@ -332,7 +384,7 @@ def build_html(namespaces):
           <div class="card-body"{body_style}>
             <div class="runs-in"><strong>Runs in:</strong> {runs_in}</div>
             <table class="cve-tbl">
-              <thead><tr><th>CVE ID</th><th>Severity</th><th>Score</th><th>Package</th><th>Current → Fixed</th><th>Patch</th><th>Exploit</th></tr></thead>
+              {_cve_table_head()}
               <tbody>{cve_rows}</tbody>
             </table>
           </div>
@@ -369,10 +421,10 @@ def build_html(namespaces):
                 {badge(w["max_score"])}
               </div>
               <div class="wl-img">
-                <span class="mono img-repo">{html.escape(w["repo"])}</span>{tag_span}<span class="digest-t">@{digest_s}</span>
+                <span class="mono img-repo">{html.escape(w["repo"])}</span>{tag_span}<span class="digest-t" title="{html.escape(w["digest"], quote=True)}">@{digest_s}</span>
               </div>
               <table class="cve-tbl">
-                <thead><tr><th>CVE ID</th><th>Severity</th><th>Score</th><th>Package</th><th>Current → Fixed</th><th>Patch</th><th>Exploit</th></tr></thead>
+                {_cve_table_head()}
                 <tbody>{cve_trs}</tbody>
               </table>
             </div>'''
@@ -514,6 +566,8 @@ def build_html(namespaces):
     .expl-chip.on-v{background:var(--critical)}
     .expl-chip.on-p{background:var(--high)}
     .expl-chip.on-k{background:var(--medium)}
+    .kpi-strip-sev{margin-top:-24px}
+    .kpi-strip-sev .kpi-num{font-size:1.3em}
     .expl-legend{font-size:.78em;color:var(--text-2);margin:0 0 20px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;gap:16px;flex-wrap:wrap;align-items:center}
     .expl-legend strong{color:var(--text);font-size:.92em}
     .expl-legend .expl-chip{cursor:default}
@@ -599,6 +653,10 @@ def build_html(namespaces):
     <div class="kpi-item"><span class="{weap_cls}">{weap_count}</span><span class="kpi-label">Weaponized</span></div>
   </div>
 
+  <div class="kpi-strip kpi-strip-sev">
+    {sev_kpi_html}
+  </div>
+
   <div class="expl-legend" aria-label="Exploit signal legend">
     <strong>Exploit signals:</strong>
     <span><span class="expl-chip on-v">V</span> Verified exploit exists</span>
@@ -652,7 +710,6 @@ function applyFilters(){{
   var patch=document.getElementById('fPatch').value;
   var expl=document.getElementById('fExpl').value;
   var search=document.getElementById('fSearch').value.toLowerCase().trim();
-  var visibleCards=0;
   document.querySelectorAll('tr[data-sev]').forEach(function(row){{
     var ok=true;
     if(sev&&row.dataset.sev!==sev)ok=false;
@@ -663,6 +720,8 @@ function applyFilters(){{
     if(expl==='k'&&row.dataset.k!=='1')ok=false;
     row.style.display=ok?'':'none';
   }});
+  var activePanel=document.querySelector('.tab-panel.active');
+  var visibleCards=0,totalCards=0;
   document.querySelectorAll('.card').forEach(function(card){{
     var s=card.dataset.search||'';
     var searchOk=!search||s.indexOf(search)!==-1;
@@ -671,10 +730,13 @@ function applyFilters(){{
     var hasContent=(totalRows===0)||(vis>0);
     var show=searchOk&&hasContent;
     card.style.display=show?'':'none';
-    if(show)visibleCards++;
+    if(activePanel&&activePanel.contains(card)){{
+      totalCards++;
+      if(show)visibleCards++;
+    }}
   }});
   var c=document.getElementById('fCount');
-  if(c)c.textContent=visibleCards+' cards visible';
+  if(c)c.textContent=visibleCards+' of '+totalCards+' visible';
 }}
 function clearFilters(){{
   document.getElementById('fSev').value='';

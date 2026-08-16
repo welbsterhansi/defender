@@ -62,6 +62,17 @@ python3 report.py
 
 Open `vulnerability_report.html` in a browser to view the executive summary.
 
+The HTML report is organized as two tabs — **Images** (Azure Container
+Registry data: one row per `repo:tag@digest`) and **Cluster** (OpenShift
+runtime data: one row per namespace/workload). Each CVE row shows three
+independent exploit signals (**V**erified / **P**ublished / **In-K**it)
+as colored chips, explained in a legend above the tabs; the Exploit
+filter can isolate any one of the three. Two columns previously loaded
+but hidden — **Fix Status** (`FixAvailable` / `NoFix` / …) and
+**Age (days)** — are now surfaced per CVE, and a per-severity KPI row
+under the main totals shows the Critical/High/Medium/Low breakdown at
+a glance.
+
 ## Development
 
 Local test/lint tooling is wired through `make`:
