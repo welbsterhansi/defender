@@ -79,6 +79,50 @@ class TestExploitCell:
 # _version_cell — HTML escaping
 # ---------------------------------------------------------------------------
 
+class TestImageRef:
+    """PR-UX-4: single `_image_ref()` helper used by both the Images tab
+    and the OpenShift tab so the container image reference always looks
+    identical (font-size, weight, digest treatment). Prior code emitted
+    different classes (`.img-digest` vs `.digest-t`) and let `.wl-img`'s
+    font-size cascade shrink the whole reference inside OpenShift cards."""
+
+    def test_two_line_stacked_layout(self) -> None:
+        cell = report._image_ref("apps/payments-api", "v1.8.4", "sha256:" + "a" * 64)
+        assert 'class="img-ref"' in cell
+        assert 'class="img-ref-primary"' in cell
+        assert 'class="img-ref-digest"' in cell
+        # repo:tag on the primary line, @sha256 on the digest line
+        assert "apps/payments-api:v1.8.4" in cell
+        assert "@sha256:" in cell
+
+    def test_missing_tag_shows_no_tag_marker(self) -> None:
+        # Consistent across both tabs — OpenShift previously omitted this;
+        # unified component always shows the marker so operators know the
+        # tag was not recorded rather than silently dropped.
+        for empty in ("", "N/A"):
+            cell = report._image_ref("apps/svc", empty, "sha256:" + "b" * 64)
+            assert "(no tag)" in cell, f"missing tag not shown for {empty!r}"
+            assert "apps/svc:" not in cell, "should not emit a stray colon when tag is empty"
+
+    def test_digest_truncated_with_full_title(self) -> None:
+        digest = "sha256:" + "c" * 64
+        cell = report._image_ref("apps/svc", "v1", digest)
+        # Truncated in the visible text
+        assert digest not in cell.split('title=')[0]
+        # Full digest in the tooltip
+        assert f'title="{digest}"' in cell
+
+    def test_html_escape_defensive(self) -> None:
+        # Defense-in-depth: real repos/tags don't contain HTML metachars,
+        # but the helper must escape regardless so a malformed CSV row
+        # can't inject markup.
+        cell = report._image_ref("bad<repo>", 'v"1"', "sha256:" + "d" * 64)
+        assert "<repo>" not in cell
+        assert "&lt;repo&gt;" in cell
+        assert '"1"' not in cell.split('title=')[0]
+        assert "&quot;1&quot;" in cell or "&#x27;1&#x27;" in cell
+
+
 class TestVersionCell:
     def test_normal_values_render(self) -> None:
         cell = report._version_cell({
@@ -348,6 +392,32 @@ class TestBuildHtmlEdgeCases:
         ns = report.load_data(str(sum_p), str(exp_p))
         html = report.build_html(ns)
         assert f'title="{digest}"' in html
+
+    def test_image_ref_uses_same_classes_in_both_tabs(self, tmp_path: Path) -> None:
+        # PR-UX-4: image reference on the Images (ACR) tab and the Cluster
+        # (OpenShift) tab must render with identical CSS classes so the
+        # component looks the same in both. Prior code used different
+        # digest classes (`.img-digest` vs `.digest-t`) and the OpenShift
+        # `.wl-img` cascade shrank the whole reference.
+        digest = "sha256:" + "e" * 64
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "apps/api", digest, "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "apps/api", digest, "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        # Both tabs emit the same helper output — the canonical class
+        # `.img-ref` should appear at least twice (once per tab).
+        assert html.count('class="img-ref"') >= 2, (
+            "img-ref should be used in both Images and OpenShift render sites"
+        )
+        # And the deprecated per-tab digest class must be gone.
+        assert 'class="digest-t"' not in html, "digest-t should be replaced by unified img-ref-digest"
+        assert 'class="img-digest"' not in html, "img-digest should be replaced by unified img-ref-digest"
 
     def test_visible_counter_format(self, tmp_path: Path) -> None:
         # PR-UX-3 Task 6: `applyFilters()` must now count `.card`s scoped to

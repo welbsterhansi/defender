@@ -77,6 +77,44 @@ def _cve_row(cve: dict[str, Any]) -> str:
     )
 
 
+def _image_ref(repo: str, tag: str, digest: str, digest_short_len: int = 24) -> str:
+    """PR-UX-4: canonical <span class="img-ref"> component for a container
+    image reference. Used by both the Images (ACR) tab and the Cluster
+    (OpenShift) tab so the reference always renders identically —
+    same font-size, weight, digest treatment, and missing-tag behaviour —
+    regardless of the parent container's font-size cascade.
+
+    Layout is two-line stacked:
+      Line 1 (`.img-ref-primary`): `repo:tag` (or `repo:(no tag)` when
+        the tag is missing/`N/A`), bold, larger.
+      Line 2 (`.img-ref-digest`): `@sha256:xxxx…`, muted colour, smaller,
+        `title=` carries the full untruncated digest.
+
+    HTML-escapes every user-controlled substring defensively — CSV rows
+    should never contain markup, but we don't rely on that.
+    """
+    tag_present = tag not in ("N/A", "")
+    if tag_present:
+        tag_html = f":{html.escape(tag)}"
+    else:
+        # The colon lives INSIDE the notag span so callers can grep for
+        # the literal `repo` substring without picking up the missing-tag
+        # separator, and the whole marker (colon + "(no tag)") is styled
+        # as one visual unit.
+        tag_html = (
+            '<span class="img-ref-notag" '
+            'title="tag not recorded by scanner">:(no tag)</span>'
+        )
+    digest_short = digest[:digest_short_len] + "..." if len(digest) > digest_short_len else digest
+    return (
+        f'<span class="img-ref">'
+        f'<span class="img-ref-primary">{html.escape(repo)}{tag_html}</span>'
+        f'<span class="img-ref-digest" title="{html.escape(digest, quote=True)}">'
+        f'@{html.escape(digest_short)}</span>'
+        f'</span>'
+    )
+
+
 def _version_cell(cve: dict[str, Any]) -> str:
     """Render the Current → Fixed cell with a copy-to-clipboard button.
 
@@ -343,13 +381,7 @@ def build_html(namespaces):
         tag_present = tag not in ("N/A", "")
         full_ref = f"{repo}:{tag}@{digest}" if tag_present else f"{repo}@{digest}"
         full_ref_attr = html.escape(full_ref, quote=True)
-        digest_short = digest[:24] + "..." if len(digest) > 24 else digest
-        tag_html_span = (
-            f'<span class="img-tag" title="tag: {html.escape(tag, quote=True)}">'
-            f':{html.escape(tag)}</span>'
-            if tag_present else
-            '<span class="img-tag img-tag-missing" title="tag not recorded by scanner">:(no tag)</span>'
-        )
+        img_ref_html = _image_ref(repo, tag, digest)
         cve_count = len(img["cves"])
         weap = img["weaponized_count"]
         weap_pill = f'<span class="pill pill-red">{weap} weaponized</span>' if weap > 0 else ""
@@ -369,9 +401,7 @@ def build_html(namespaces):
         <div class="card" data-search="{html.escape(search_terms.lower(), quote=True)}">
           <button class="card-btn" onclick="toggle(this)">
             <div class="card-left">
-              <span class="img-ref mono">
-                <span class="img-repo">{html.escape(repo)}</span>{tag_html_span}<span class="img-digest" title="{html.escape(digest, quote=True)}">@{digest_short}</span>
-              </span>
+              {img_ref_html}
               <button class="copy-btn copy-btn-ref" data-copy="{full_ref_attr}" onclick="cpy(this)" title="Copy {full_ref_attr}">⧉</button>
             </div>
             <div class="card-right">
@@ -404,12 +434,8 @@ def build_html(namespaces):
 
         wl_cards = ""
         for (wtype, wname), w in sorted(ws.items(), key=lambda x: -x[1]["max_score"]):
-            digest_s = w["digest"][:24] + "..."
             cve_trs = "".join(_cve_row(c) for c in sorted(w["cves"], key=lambda x: -x["score"]))
-            tag_span = (
-                f'<span class="img-tag">:{html.escape(w["tag"])}</span>'
-                if w.get("tag") and w["tag"] not in ("N/A", "") else ""
-            )
+            img_ref_html = _image_ref(w["repo"], w.get("tag", ""), w["digest"])
             wl_cards += f'''
             <div class="wl-card">
               <div class="wl-hdr">
@@ -420,9 +446,7 @@ def build_html(namespaces):
                 </div>
                 {badge(w["max_score"])}
               </div>
-              <div class="wl-img">
-                <span class="mono img-repo">{html.escape(w["repo"])}</span>{tag_span}<span class="digest-t" title="{html.escape(w["digest"], quote=True)}">@{digest_s}</span>
-              </div>
+              <div class="wl-img">{img_ref_html}</div>
               <table class="cve-tbl">
                 {_cve_table_head()}
                 <tbody>{cve_trs}</tbody>
@@ -519,12 +543,18 @@ def build_html(namespaces):
     .card-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
     .card-body{display:none;padding:4px 16px 14px;border-top:1px solid var(--border)}
     .chev{transition:transform .18s;display:flex;color:var(--text-3)}
-    .img-ref{display:inline-flex;align-items:baseline;gap:0;flex-wrap:wrap;min-width:0}
-    .img-repo{color:var(--text);font-weight:600;font-size:.92em}
-    .img-tag{display:inline-block;background:#DBEAFE;color:#1E40AF;font-weight:700;padding:1px 8px;border-radius:4px;margin:0 4px;font-size:.9em;letter-spacing:.2px}
-    .img-tag-missing{background:var(--bg);color:var(--text-3);font-weight:500}
-    .img-digest{color:var(--text-3);font-size:.8em;overflow:hidden;text-overflow:ellipsis}
-    .digest-t{color:var(--text-3);font-size:.82em;margin-left:2px}
+    /* PR-UX-4: canonical image reference — same shape/size in Images
+       and OpenShift tabs. Font-sizes are fixed (not em-relative to the
+       parent) so an outer container's font-size cascade never shrinks
+       the whole reference (the previous `.wl-img{font-size:.85em}`
+       cascade did exactly that, only in the OpenShift tab). Mono font
+       is applied here directly instead of via the shared `.mono` class,
+       because `.mono` also sets `font-size:.88em` — which would re-open
+       the same cascade problem we just closed. */
+    .img-ref{display:flex;flex-direction:column;gap:2px;min-width:0;font-size:14px;font-family:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Monaco,'Cascadia Mono',monospace}
+    .img-ref-primary{color:var(--text);font-weight:600;font-size:14px;line-height:1.4;word-break:break-all}
+    .img-ref-digest{color:var(--text-3);font-size:11.5px;line-height:1.3;word-break:break-all}
+    .img-ref-notag{color:var(--text-3);font-weight:500;font-style:italic}
     .ns-name{font-weight:700;font-size:.92em;color:var(--text)}
     .pill{background:var(--bg);color:var(--text-2);border:1px solid var(--border);border-radius:20px;padding:1px 8px;font-size:.72em;font-weight:600;font-variant-numeric:tabular-nums}
     .pill-y{background:#FEF9C3;color:#854D0E;border-color:#FDE68A}
@@ -546,7 +576,11 @@ def build_html(namespaces):
     .wl-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
     .wl-name{font-weight:700;font-size:.9em;color:var(--text)}
     .wl-cpill{background:#FED7AA;color:#9A3412;border-radius:20px;padding:1px 8px;font-size:.72em;font-weight:600}
-    .wl-img{display:flex;align-items:baseline;gap:0;font-size:.85em;margin-bottom:10px;flex-wrap:wrap}
+    /* PR-UX-4: `.wl-img` no longer sets font-size — that cascade was
+       shrinking the whole `.img-ref` inside OpenShift cards to ~.85em,
+       making the same image reference look smaller than in the Images
+       tab. It is now just a spacer around the shared `.img-ref` block. */
+    .wl-img{margin-bottom:10px;min-width:0}
     .cve-tbl{width:100%;border-collapse:collapse;font-size:.85em;background:var(--surface);border-radius:5px;overflow:hidden}
     .cve-tbl thead th{padding:8px 10px;text-align:left;font-size:.68em;text-transform:uppercase;letter-spacing:.6px;color:var(--text-3);font-weight:700;background:var(--bg);border-bottom:1px solid var(--border)}
     .cve-tbl td{padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:middle}
