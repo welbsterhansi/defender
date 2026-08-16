@@ -967,6 +967,14 @@ SKIP_TOKEN=""
 TOTAL_PROCESSED=0
 PAGE_NUM=0
 
+# PR-B: tag cache is now **execution-global** (not per-page). If a repo shows
+# up in pages 1 and 3, we call `show-tags` only once — the response is the
+# whole tag list for that repo, so nothing new to learn on the second visit.
+# REPO_TAGS_TRIED tracks "already attempted" so a failed repo is not retried
+# every page (blast radius: N digests of that repo → TAG=N/A, 1 WARN total).
+declare -A TAG_CACHE=()
+declare -A REPO_TAGS_TRIED=()
+
 while : ; do
     PAGE_NUM=$((PAGE_NUM + 1))
     _t_page_start=$(_now_realtime)
@@ -994,26 +1002,60 @@ while : ; do
 
     echo "[Page ${PAGE_NUM}] batch=${BATCH_COUNT} images, total_before=${TOTAL_PROCESSED}, retries=${LAST_QUERY_RETRIES}"
 
-    # ── phase 2: tag_resolve (per-page tag cache) ────────────────────────
+    # ── phase 2: tag_resolve (per-repo, execution-global cache) ─────────
+    # PR-B: previously one `show-tags` per unique digest (redundant — the
+    # response holds ALL tags of the repo). Now one call per unique repo
+    # across the whole execution:
+    #   1. jq extracts unique repos from THIS page.
+    #   2. Skip repos already resolved (or already known-failed) in a
+    #      prior page — REPO_TAGS_TRIED is the "done" set.
+    #   3. For each new repo, fetch `show-tags --detail --top 5000` once
+    #      and populate TAG_CACHE[repo@digest] for every entry, keeping
+    #      FIRST-tag-wins semantics for digests that carry multiple tags
+    #      (matches the prior "[0]" JMESPath filter).
+    #   4. Truncation guard: if the response has exactly 5000 entries the
+    #      repo may have more tags — log a WARN so operators know some
+    #      digests may fall back to N/A. Never aborts.
+    # `_tag_api_calls` counts az calls MADE this page (0 when everything
+    # was already cached from earlier pages).
     _t_tags_start=$(_now_realtime)
     _tag_api_calls=0
-    # Build tag cache for unique repo+digest pairs in this batch (1 call per unique digest)
-    declare -A TAG_CACHE
-    while IFS= read -r cache_entry; do
-        c_repo=$(echo "$cache_entry" | base64 --decode | jq -r '.repository')
-        c_digest=$(echo "$cache_entry" | base64 --decode | jq -r '.digest')
-        cache_key="${c_repo}@${c_digest}"
-        if [ -z "${TAG_CACHE[$cache_key]+x}" ]; then
-            _tag_api_calls=$((_tag_api_calls + 1))
-            c_tag=$(az acr repository show-tags \
-                --name "$ACR_NAME" \
-                --repository "$c_repo" \
-                --detail \
-                --query "[?digest=='$c_digest'].name | [0]" \
-                --output tsv 2>/dev/null | tr -d '\r' || echo "N/A")
-            TAG_CACHE[$cache_key]="${c_tag:-N/A}"
+    while IFS= read -r repo_name; do
+        [ -z "$repo_name" ] && continue
+        # Repo already attempted (success OR fail) — don't re-hit az.
+        if [ -n "${REPO_TAGS_TRIED[$repo_name]+x}" ]; then
+            continue
         fi
-    done < <(echo "$RESPONSE" | jq -r '.data[] | @base64')
+        REPO_TAGS_TRIED[$repo_name]=1
+        _tag_api_calls=$((_tag_api_calls + 1))
+
+        tags_json=$(az acr repository show-tags \
+            --name "$ACR_NAME" \
+            --repository "$repo_name" \
+            --detail \
+            --top 5000 \
+            --output json 2>/dev/null || true)
+
+        if [ -z "$tags_json" ] || ! printf '%s' "$tags_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            log_warn "show-tags failed for repository=$repo_name — digests in this repo will use TAG=N/A"
+            continue
+        fi
+
+        tag_count=$(printf '%s' "$tags_json" | jq 'length' 2>/dev/null || echo 0)
+        if [ "$tag_count" = "5000" ]; then
+            log_warn "show-tags returned exactly 5000 entries for repository=$repo_name — response may be truncated; some digests may fall back to TAG=N/A"
+        fi
+
+        # Populate TAG_CACHE preserving FIRST-tag-wins for duplicate digests
+        # (jq iterates array in order; the [ -z +x ] guard keeps the first).
+        while IFS=$'\x1f' read -r d_digest d_name; do
+            [ -z "$d_digest" ] && continue
+            key="${repo_name}@${d_digest}"
+            if [ -z "${TAG_CACHE[$key]+x}" ]; then
+                TAG_CACHE[$key]="$d_name"
+            fi
+        done < <(printf '%s' "$tags_json" | jq -r '.[] | select(.digest and .name) | [.digest, .name] | join("\u001f")')
+    done < <(printf '%s' "$RESPONSE" | jq -r '[.data[].repository] | unique | .[]')
     _t_tags_ms=$(_elapsed_ms "$_t_tags_start")
 
     # ── phase 3: rows (parse + CSV write) ────────────────────────────────
