@@ -96,10 +96,10 @@ def test_e2e_full_pipeline(
         assert needle in html, f"HTML missing {label}: expected {needle!r}"
 
     # Icons — the fixture exercises all three exploit states + patch states
-    #   CVE-2024-0002: hasVerifiedExploit=true → 🔴
+    #   CVE-2024-0002: hasVerifiedExploit=true → lit "V" chip
     #   CVE-2024-0001: patchable=true          → ✅
     #   CVE-2024-0003: patchable=false         → ❌
-    assert "🔴" in html, "verified exploit icon missing"
+    assert 'class="expl-chip on-v"' in html, "verified exploit chip missing"
     assert "✅" in html, "patchable check missing"
     assert "❌" in html, "not-patchable cross missing"
 
@@ -319,11 +319,11 @@ def test_exploit_flags_survive_full_pipeline(
             "verified-exploit flag lost on write_output"
         )
 
-    # Stage 4: report picks it up and renders 🔴 for verified exploit
+    # Stage 4: report picks it up and renders the lit "V" chip for verified exploit
     ns = report.load_data(str(cruzamento_csv_new), str(expanded_path))
     html = report.build_html(ns)
-    assert "🔴" in html, (
-        "verified-exploit CVE did not render the red-circle icon in HTML"
+    assert 'class="expl-chip on-v"' in html, (
+        "verified-exploit CVE did not render the lit V chip in HTML"
     )
     # And the weaponized KPI counts it (>= 1 entry weaponized)
     assert 'class="kpi-num critical"' in html, (
