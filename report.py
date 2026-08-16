@@ -54,6 +54,9 @@ def _cve_row(cve: dict[str, Any]) -> str:
     patch = str(cve.get("patchable", "")).lower()
     pkg   = cve.get("packageName", "") or ""
     patch_icon = "✅" if patch == "true" else ("❌" if patch == "false" else "—")
+    patch_label = ("Patchable" if patch == "true"
+                   else "Not patchable" if patch == "false"
+                   else "Patch status unknown")
     v = "1" if _has_flag(cve, "hasVerifiedExploit") else "0"
     p = "1" if _has_flag(cve, "hasPublishedExploit") else "0"
     k = "1" if _has_flag(cve, "isInExploitKit") else "0"
@@ -66,7 +69,7 @@ def _cve_row(cve: dict[str, Any]) -> str:
         f'<td>{badge(cve["score"])}</td>'
         f'<td class="mono" style="font-size:.8em;color:#475569">{html.escape(pkg)}</td>'
         f'{_version_cell(cve)}'
-        f'<td style="font-size:.8em;text-align:center">{patch_icon}</td>'
+        f'<td style="font-size:.8em;text-align:center" aria-label="{patch_label}">{patch_icon}</td>'
         f'{_fix_status_cell(cve)}'
         f'{_age_cell(cve)}'
         f'{_exploit_cell(cve)}'
@@ -367,7 +370,7 @@ def build_html(namespaces):
           <button class="card-btn" onclick="toggle(this)">
             <div class="card-left">
               <span class="img-ref mono">
-                <span class="img-repo">{html.escape(repo)}</span>{tag_html_span}<span class="img-digest">@{digest_short}</span>
+                <span class="img-repo">{html.escape(repo)}</span>{tag_html_span}<span class="img-digest" title="{html.escape(digest, quote=True)}">@{digest_short}</span>
               </span>
               <button class="copy-btn copy-btn-ref" data-copy="{full_ref_attr}" onclick="cpy(this)" title="Copy {full_ref_attr}">⧉</button>
             </div>
@@ -418,7 +421,7 @@ def build_html(namespaces):
                 {badge(w["max_score"])}
               </div>
               <div class="wl-img">
-                <span class="mono img-repo">{html.escape(w["repo"])}</span>{tag_span}<span class="digest-t">@{digest_s}</span>
+                <span class="mono img-repo">{html.escape(w["repo"])}</span>{tag_span}<span class="digest-t" title="{html.escape(w["digest"], quote=True)}">@{digest_s}</span>
               </div>
               <table class="cve-tbl">
                 {_cve_table_head()}
@@ -707,7 +710,6 @@ function applyFilters(){{
   var patch=document.getElementById('fPatch').value;
   var expl=document.getElementById('fExpl').value;
   var search=document.getElementById('fSearch').value.toLowerCase().trim();
-  var visibleCards=0;
   document.querySelectorAll('tr[data-sev]').forEach(function(row){{
     var ok=true;
     if(sev&&row.dataset.sev!==sev)ok=false;
@@ -718,6 +720,8 @@ function applyFilters(){{
     if(expl==='k'&&row.dataset.k!=='1')ok=false;
     row.style.display=ok?'':'none';
   }});
+  var activePanel=document.querySelector('.tab-panel.active');
+  var visibleCards=0,totalCards=0;
   document.querySelectorAll('.card').forEach(function(card){{
     var s=card.dataset.search||'';
     var searchOk=!search||s.indexOf(search)!==-1;
@@ -726,10 +730,13 @@ function applyFilters(){{
     var hasContent=(totalRows===0)||(vis>0);
     var show=searchOk&&hasContent;
     card.style.display=show?'':'none';
-    if(show)visibleCards++;
+    if(activePanel&&activePanel.contains(card)){{
+      totalCards++;
+      if(show)visibleCards++;
+    }}
   }});
   var c=document.getElementById('fCount');
-  if(c)c.textContent=visibleCards+' cards visible';
+  if(c)c.textContent=visibleCards+' of '+totalCards+' visible';
 }}
 function clearFilters(){{
   document.getElementById('fSev').value='';

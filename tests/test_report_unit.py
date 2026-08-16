@@ -148,6 +148,11 @@ class TestCveRow:
         assert "NoFix" in row
         assert ">120<" in row
 
+    def test_patch_cell_has_aria_label(self) -> None:
+        assert 'aria-label="Patchable"' in self._row(patchable="true")
+        assert 'aria-label="Not patchable"' in self._row(patchable="false")
+        assert 'aria-label="Patch status unknown"' in self._row(patchable="")
+
 
 # ---------------------------------------------------------------------------
 # _fix_status_cell — Fix Status column (PR-UX-3 Task 4)
@@ -326,6 +331,40 @@ class TestBuildHtmlEdgeCases:
         html = report.build_html(ns)
         assert "CVE-1" in html
         assert "Vulnerable Images" in html
+
+    def test_full_digest_available_via_title(self, tmp_path: Path) -> None:
+        # PR-UX-3 Task 6: the truncated `@digest_short` shown in image and
+        # workload cards must expose the FULL sha256 via a `title=` tooltip
+        # so devs can copy/inspect it without regenerating the report.
+        digest = "sha256:" + "a" * 64
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", digest, "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", digest, "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert f'title="{digest}"' in html
+
+    def test_visible_counter_format(self, tmp_path: Path) -> None:
+        # PR-UX-3 Task 6: `applyFilters()` must now count `.card`s scoped to
+        # the ACTIVE `.tab-panel` so the "N of M visible" text reflects
+        # what the user is currently looking at, not the sum of both tabs.
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert "activePanel" in html
+        assert "totalCards" in html
 
     def test_exploit_legend_visible_by_default(self, tmp_path: Path) -> None:
         sum_p, exp_p = self._minimal_csvs(
