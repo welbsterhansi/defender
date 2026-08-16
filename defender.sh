@@ -23,6 +23,7 @@ UNBLOCK_ALL=false
 LIST_BLOCKED=false
 IMAGE=""
 SCAN_IMAGE=""
+SKIP_TAGS=false
 REPORT_FILE="vulnerable_images_report.csv"
 
 # Function to classify severity based on CVSS score
@@ -286,6 +287,11 @@ usage() {
     echo "  --image <IMAGE>      Specific image to unblock (format: repo@sha256:digest)"
     echo "  --scan-image <IMAGE> Scan for CVEs (formats: repo, repo:tag, repo@sha256:digest)"
     echo "  --list-blocked       List all blocked images in ACR (or specific repository)"
+    echo "  --skip-tags          Skip the tag_resolve phase entirely (Optional)"
+    echo "                       - Zero 'az repository show-tags' calls"
+    echo "                       - Every row in the CSV has tag=\"N/A\""
+    echo "                       - Escape hatch for large scans where CVE data is all that matters"
+    echo "                       - Incompatible with --scan-image"
     echo "  --auto-approve       Skip confirmation prompt (use with caution!)"
     echo "  --debug              Print generated KQL query and run diagnostic ARG preview"
     echo "  --help, -h           Show this help message"
@@ -364,6 +370,7 @@ while [[ "$#" -gt 0 ]]; do
         --unblock-all) UNBLOCK_ALL=true ;;
         --image) IMAGE="$2"; shift ;;
         --scan-image) SCAN_IMAGE="$2"; shift ;;
+        --skip-tags) SKIP_TAGS=true ;;
         --list-blocked) LIST_BLOCKED=true ;;
         --auto-approve) AUTO_APPROVE=true ;;
         --debug) DEBUG=true ;;
@@ -414,6 +421,19 @@ if [ "$_scope_flags" -gt 1 ]; then
     echo "Error: --repository, --repositories and --scan-image are mutually exclusive." >&2
     echo "       Pick one scoping flag." >&2
     exit 1
+fi
+
+# --skip-tags bypasses the whole tag resolution phase. It is contradictory
+# with --scan-image, which explicitly resolves tag → digest up front and
+# needs the tag machinery. Fail early with exit 2 so operators see the
+# mistake instead of a report full of N/As they did not ask for.
+if [ "$SKIP_TAGS" = true ] && [ -n "$SCAN_IMAGE" ]; then
+    echo "Error: --skip-tags is incompatible with --scan-image." >&2
+    echo "       --scan-image resolves tag → digest, so it cannot skip tags." >&2
+    exit 2
+fi
+if [ "$SKIP_TAGS" = true ]; then
+    log_info "tag_resolve DISABLED via --skip-tags (all rows will have tag=N/A)"
 fi
 
 # Check prerequisites
@@ -1018,8 +1038,17 @@ while : ; do
     #      digests may fall back to N/A. Never aborts.
     # `_tag_api_calls` counts az calls MADE this page (0 when everything
     # was already cached from earlier pages).
+    #
+    # PR-C: --skip-tags bypasses the whole phase. TAG_CACHE stays empty,
+    # every row falls back to "N/A" via the `${...:-N/A}` default in
+    # phase 3. Timing fields still report (as 0) so the log line format
+    # stays stable for dashboards/benchmarks.
     _t_tags_start=$(_now_realtime)
     _tag_api_calls=0
+    if [ "$SKIP_TAGS" = true ]; then
+        _t_tags_ms=0
+        # phase 2 intentionally skipped — jump to phase 3 with empty cache.
+    else
     while IFS= read -r repo_name; do
         [ -z "$repo_name" ] && continue
         # Repo already attempted (success OR fail) — don't re-hit az.
@@ -1057,6 +1086,7 @@ while : ; do
         done < <(printf '%s' "$tags_json" | jq -r '.[] | select(.digest and .name) | [.digest, .name] | join("\u001f")')
     done < <(printf '%s' "$RESPONSE" | jq -r '[.data[].repository] | unique | .[]')
     _t_tags_ms=$(_elapsed_ms "$_t_tags_start")
+    fi
 
     # ── phase 3: rows (parse + CSV write) ────────────────────────────────
     _t_rows_start=$(_now_realtime)

@@ -38,6 +38,13 @@ Target runtime is Linux / WSL (bash 4+). macOS works for local dev if you instal
 #    → each entry validated against the ACR before the query runs
 #    → empty entries (',,') or duplicates abort the run
 
+# Fast mode — skip the tag_resolve phase (CI/CD, large scans, CVE counts only):
+./defender.sh --acr-name <ACR_NAME> --min-score 9 --skip-tags
+#    → zero 'az repository show-tags' calls
+#    → every CSV row has tag="N/A"
+#    → phase-2 latency drops to 0ms; downstream (report.py, expandcsv.py) is unchanged
+#    → incompatible with --scan-image (which resolves tag → digest up front)
+
 # 2. Cross-reference with running OpenShift workloads
 ./check_ocp.sh vulnerable_images_report.csv resultado_cruzamento.csv
 #    → resultado_cruzamento.csv (one row per workload+image, CVEs aggregated)
@@ -113,10 +120,10 @@ Fields:
 - `batch` — rows returned by ARG on this page (≤ 1000, server-side max)
 - `total` — cumulative rows written so far
 - `retries` — retries used by `run_graph_query` on this specific page
-- `tag_api_calls` — how many `az repository show-tags` calls the tag cache made
+- `tag_api_calls` — `az repository show-tags` calls made on THIS page (0 when every repo was already cached from an earlier page, or when `--skip-tags` is set)
 - `timings_ms` — per-phase wall-clock in milliseconds:
   - `graph_query` — Azure Resource Graph round-trip (network + server compute)
-  - `tag_resolve` — tag cache build (currently 1 call per unique digest)
+  - `tag_resolve` — tag cache build (1 call per unique repo per execution; `0` when `--skip-tags` is set)
   - `rows` — CSV parsing + write for the whole batch
   - `total` — sum of the phases (small delta = overhead)
 
