@@ -543,6 +543,21 @@ class TestPrcSkipTagsFlag:
             assert "graph query" not in log
             assert "show-tags"   not in log
 
+    def test_skip_tags_appears_in_log_header(self, tmp_path: Path) -> None:
+        # Reviewer nit: init_logging must reflect --skip-tags in the header
+        # args, not only in the follow-up INFO line, so the audit trail is
+        # self-contained.
+        pages = [{"data": [_row("a" * 64, repo="repo-alpha")], "skip_token": ""}]
+        r = _run_defender(tmp_path, pages, extra_args=["--skip-tags"])
+        assert r.returncode == 0, r.stderr
+
+        log = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
+        # init_logging emits an "args:" header line. We only assert the flag
+        # appears in the first few lines (header block), not anywhere in the
+        # body (INFO log lines come later).
+        header = "\n".join(log.splitlines()[:12])
+        assert "--skip-tags" in header, header
+
     def test_default_still_resolves_tags_regression_guard(
         self, tmp_path: Path
     ) -> None:

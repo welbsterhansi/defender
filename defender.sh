@@ -401,13 +401,16 @@ fi
 
 # shellcheck source=lib/logging.sh
 source "$(dirname "$0")/lib/logging.sh"
+_SKIP_TAGS_ARG=""
+[ "$SKIP_TAGS" = true ] && _SKIP_TAGS_ARG="--skip-tags"
 init_logging "defender.sh" "$_LOG_MODE" \
     --acr-name "$ACR_NAME" \
     --min-score "$MIN_SCORE" --max-score "$MAX_SCORE" \
     ${REPOSITORY:+--repository "$REPOSITORY"} \
     ${REPOSITORIES:+--repositories "$REPOSITORIES"} \
     ${SCAN_IMAGE:+--scan-image "$SCAN_IMAGE"} \
-    ${IMAGE:+--image "$IMAGE"}
+    ${IMAGE:+--image "$IMAGE"} \
+    ${_SKIP_TAGS_ARG:+$_SKIP_TAGS_ARG}
 log_info "start acr=$ACR_NAME mode=$_LOG_MODE score_range=${MIN_SCORE}..${MAX_SCORE}"
 
 # --repository, --repositories and --scan-image define the scan scope in
