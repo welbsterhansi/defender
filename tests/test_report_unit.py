@@ -393,6 +393,74 @@ class TestBuildHtmlEdgeCases:
         html = report.build_html(ns)
         assert f'title="{digest}"' in html
 
+    def test_no_button_nested_inside_another_button(self, tmp_path: Path) -> None:
+        # PR-UX-4 fix-up: nesting a <button> inside another <button> is
+        # invalid HTML. Browsers auto-close the outer button on encountering
+        # the inner one, which used to leak subsequent `.card` elements out
+        # of their `.tab-panel` wrapper — measurable in playwright as
+        # "closest('.tab-panel')" returning null for cards 2..N. This test
+        # walks the generated HTML with html.parser and fails on any
+        # nested-button occurrence, so the class of bug can't come back
+        # from a future refactor.
+        from html.parser import HTMLParser
+
+        class ButtonNestingChecker(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.button_depth = 0
+                self.violations: list[str] = []
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                if tag == "button":
+                    if self.button_depth > 0:
+                        self.violations.append(str(dict(attrs)))
+                    self.button_depth += 1
+
+            def handle_endtag(self, tag: str) -> None:
+                if tag == "button" and self.button_depth > 0:
+                    self.button_depth -= 1
+
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html_output = report.build_html(ns)
+
+        checker = ButtonNestingChecker()
+        checker.feed(html_output)
+        assert not checker.violations, (
+            f"Nested <button> detected — HTML parser will auto-close the "
+            f"outer button and leak subsequent DOM out of its wrapper. "
+            f"Offending inner button(s): {checker.violations}"
+        )
+
+    def test_image_ref_has_fit_content_width(self, tmp_path: Path) -> None:
+        # PR-UX-4 fix-up: locks the CSS invariant that guarantees identical
+        # image-reference width in both tabs. Without `width:fit-content`
+        # the same repo would render at ~200px in the Images tab (shrunk
+        # by `.card-left` flex-row) and ~1000px in the Cluster tab
+        # (stretched to fill `.wl-card`).
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html_output = report.build_html(ns)
+        # Grep the generated <style> block for the .img-ref rule.
+        assert "width:fit-content" in html_output, (
+            ".img-ref must use width:fit-content so it sizes identically "
+            "in both tabs (Images `.card-left` flex-row and Cluster `.wl-img` block)"
+        )
+
     def test_image_ref_uses_same_classes_in_both_tabs(self, tmp_path: Path) -> None:
         # PR-UX-4: image reference on the Images (ACR) tab and the Cluster
         # (OpenShift) tab must render with identical CSS classes so the

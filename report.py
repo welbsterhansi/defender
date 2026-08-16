@@ -399,7 +399,7 @@ def build_html(namespaces):
         chev_style = ' style="transform:rotate(180deg)"' if i < 3 else ''
         image_cards += f'''
         <div class="card" data-search="{html.escape(search_terms.lower(), quote=True)}">
-          <button class="card-btn" onclick="toggle(this)">
+          <div class="card-btn" role="button" tabindex="0" onclick="toggle(this)">
             <div class="card-left">
               {img_ref_html}
               <button class="copy-btn copy-btn-ref" data-copy="{full_ref_attr}" onclick="cpy(this)" title="Copy {full_ref_attr}">⧉</button>
@@ -410,7 +410,7 @@ def build_html(namespaces):
               {weap_pill}
               <span class="chev"{chev_style}>{ic("chevron",15,"#94A3B8")}</span>
             </div>
-          </button>
+          </div>
           <div class="card-body"{body_style}>
             <div class="runs-in"><strong>Runs in:</strong> {runs_in}</div>
             <table class="cve-tbl">
@@ -457,7 +457,7 @@ def build_html(namespaces):
                              [w["name"] for w in ws.values()])
         ns_html += f'''
         <div class="card" data-search="{html.escape(ns_search.lower(), quote=True)}">
-          <button class="card-btn" onclick="toggle(this)">
+          <div class="card-btn" role="button" tabindex="0" onclick="toggle(this)">
             <div class="card-left">
               <span class="ns-name">{html.escape(ns_name)}</span>
               <span class="pill">{len(ws)} workload{"s" if len(ws)>1 else ""}</span>
@@ -467,7 +467,7 @@ def build_html(namespaces):
               {badge(ns_score)}
               <span class="chev">{ic("chevron",15,"#94A3B8")}</span>
             </div>
-          </button>
+          </div>
           <div class="card-body">{wl_cards}</div>
         </div>'''
 
@@ -539,6 +539,11 @@ def build_html(namespaces):
     .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;overflow:hidden}
     .card-btn{width:100%;background:none;border:0;cursor:pointer;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:16px;color:inherit;text-align:left}
     .card-btn:hover{background:var(--bg)}
+    /* PR-UX-4 fix-up: .card-btn is a <div role="button"> (was <button> which
+       created invalid nested-button HTML with .copy-btn-ref inside).
+       Restore the native-button focus ring so keyboard nav stays visible. */
+    .card-btn:focus{outline:2px solid var(--accent);outline-offset:-2px}
+    .card-btn:focus:not(:focus-visible){outline:none}
     .card-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;flex:1}
     .card-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
     .card-body{display:none;padding:4px 16px 14px;border-top:1px solid var(--border)}
@@ -551,7 +556,14 @@ def build_html(namespaces):
        is applied here directly instead of via the shared `.mono` class,
        because `.mono` also sets `font-size:.88em` — which would re-open
        the same cascade problem we just closed. */
-    .img-ref{display:flex;flex-direction:column;gap:2px;min-width:0;font-size:14px;font-family:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Monaco,'Cascadia Mono',monospace}
+    /* `width:fit-content;max-width:100%` gives the SAME width behavior
+       in both tabs. Without it: Images tab shrinks to content (because
+       `.card-left` is a flex-row where `.img-ref` competes with the
+       copy button), while Cluster tab stretches to the full `.wl-card`
+       width (because `.wl-img` is a plain block, so a flex-column child
+       fills 100%). Now both size to content up to the parent's max —
+       identical visual weight in both contexts. */
+    .img-ref{display:flex;flex-direction:column;gap:2px;min-width:0;width:fit-content;max-width:100%;font-size:14px;font-family:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Monaco,'Cascadia Mono',monospace}
     .img-ref-primary{color:var(--text);font-weight:600;font-size:14px;line-height:1.4;word-break:break-all}
     .img-ref-digest{color:var(--text-3);font-size:11.5px;line-height:1.3;word-break:break-all}
     .img-ref-notag{color:var(--text-3);font-weight:500;font-style:italic}
@@ -729,6 +741,15 @@ def build_html(namespaces):
 </div>
 <script>
 function toggle(b){{var d=b.nextElementSibling;var o=d.style.display==='block';d.style.display=o?'none':'block';var c=b.querySelector('.chev');if(c)c.style.transform=o?'':'rotate(180deg)';}}
+// `.card-btn` is a <div role="button"> (nesting a real <button> inside another
+// <button> is invalid HTML and the parser used to auto-close the outer button,
+// leaking subsequent .card elements out of their .tab-panel). Provide native
+// keyboard activation so a screen-reader / keyboard user still gets full behavior.
+document.addEventListener('keydown',function(e){{
+  if(e.key!=='Enter'&&e.key!==' ')return;
+  var t=e.target;
+  if(t&&t.classList&&t.classList.contains('card-btn')){{e.preventDefault();t.click();}}
+}});
 function cpy(btn){{event.stopPropagation();var t=btn.dataset.copy||'';if(navigator.clipboard){{navigator.clipboard.writeText(t).then(function(){{var o=btn.textContent;btn.textContent='✓';btn.classList.add('ok');setTimeout(function(){{btn.textContent=o;btn.classList.remove('ok');}},900);}});}}}}
 function switchTab(name){{
   document.querySelectorAll('.tab-panel').forEach(function(p){{p.classList.toggle('active',p.id==='tab-'+name);}});
