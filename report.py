@@ -501,6 +501,14 @@ def build_html(namespaces):
     .bar-label{font-size:.85em;color:var(--text-2);font-weight:600;font-variant-numeric:tabular-nums}
     .footer{text-align:center;color:var(--text-3);font-size:.72em;margin-top:40px;padding-bottom:16px;letter-spacing:.4px}
     @media(max-width:720px){.kpi-item{min-width:50%}.container{padding:16px 12px 40px}.topbar{padding:0 16px}}
+    .tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:20px}
+    .tab-btn{background:none;border:0;border-bottom:2px solid transparent;padding:10px 4px;margin-right:24px;font-family:inherit;font-size:.88em;font-weight:700;color:var(--text-3);cursor:pointer}
+    .tab-btn:hover{color:var(--text-2)}
+    .tab-btn.active{color:var(--text);border-bottom-color:var(--accent)}
+    .tab-src{font-size:.72em;font-weight:600;background:var(--bg);border:1px solid var(--border);border-radius:20px;padding:0 7px;margin-left:6px;color:var(--text-3)}
+    .tab-panel{display:none}
+    .tab-panel.active{display:block}
+    .src-tag{font-size:.68em;text-transform:none;letter-spacing:0;font-weight:600;color:var(--text-3);background:var(--bg);border:1px solid var(--border);border-radius:20px;padding:1px 9px;margin-left:8px;vertical-align:middle}
     """
 
     return f"""<!DOCTYPE html>
@@ -561,13 +569,28 @@ def build_html(namespaces):
     <div class="kpi-item"><span class="{weap_cls}">{weap_count}</span><span class="kpi-label">Weaponized</span></div>
   </div>
 
-  <h2 class="section-title">Vulnerable Images</h2>
-  <p class="section-note">Grouped by <code>repo:tag@digest</code>. Sorted by max CVSS descending. Top {min(3, total_images)} expanded by default.</p>
-  {image_cards}
+  <div class="tabs" role="tablist" aria-label="Report view">
+    <button class="tab-btn active" id="tabbtn-images" role="tab" aria-selected="true"
+            aria-controls="tab-images" onclick="switchTab('images')">
+      Images <span class="tab-src">ACR</span>
+    </button>
+    <button class="tab-btn" id="tabbtn-cluster" role="tab" aria-selected="false"
+            aria-controls="tab-cluster" onclick="switchTab('cluster')">
+      Cluster <span class="tab-src">OpenShift</span>
+    </button>
+  </div>
 
-  <h2 class="section-title">Namespace Detail</h2>
-  <p class="section-note">Same findings organized by OpenShift namespace and workload. Sorted by CVE count.</p>
-  {ns_html}
+  <div class="tab-panel active" id="tab-images" role="tabpanel" aria-labelledby="tabbtn-images">
+    <h2 class="section-title">Vulnerable Images <span class="src-tag">Azure Container Registry</span></h2>
+    <p class="section-note">Grouped by <code>repo:tag@digest</code>. Sorted by max CVSS descending. Top {min(3, total_images)} expanded by default.</p>
+    {image_cards}
+  </div>
+
+  <div class="tab-panel" id="tab-cluster" role="tabpanel" aria-labelledby="tabbtn-cluster">
+    <h2 class="section-title">Namespace Detail <span class="src-tag">OpenShift Cluster (Runtime)</span></h2>
+    <p class="section-note">Same findings organized by OpenShift namespace and workload. Sorted by CVE count.</p>
+    {ns_html}
+  </div>
 
   <h2 class="section-title">Most Widespread CVEs</h2>
   <p class="section-note">Reference view — CVEs sorted by number of workloads they affect.</p>
@@ -578,6 +601,15 @@ def build_html(namespaces):
 <script>
 function toggle(b){{var d=b.nextElementSibling;var o=d.style.display==='block';d.style.display=o?'none':'block';var c=b.querySelector('.chev');if(c)c.style.transform=o?'':'rotate(180deg)';}}
 function cpy(btn){{event.stopPropagation();var t=btn.dataset.copy||'';if(navigator.clipboard){{navigator.clipboard.writeText(t).then(function(){{var o=btn.textContent;btn.textContent='✓';btn.classList.add('ok');setTimeout(function(){{btn.textContent=o;btn.classList.remove('ok');}},900);}});}}}}
+function switchTab(name){{
+  document.querySelectorAll('.tab-panel').forEach(function(p){{p.classList.toggle('active',p.id==='tab-'+name);}});
+  document.querySelectorAll('.tab-btn').forEach(function(b){{
+    var on=b.id==='tabbtn-'+name;
+    b.classList.toggle('active',on);
+    b.setAttribute('aria-selected',on?'true':'false');
+  }});
+  applyFilters();
+}}
 function applyFilters(){{
   var sev=document.getElementById('fSev').value;
   var patch=document.getElementById('fPatch').value;
