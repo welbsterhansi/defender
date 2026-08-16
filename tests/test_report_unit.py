@@ -129,11 +129,8 @@ class TestCveRow:
         assert 'data-patch="true"' in self._row(patchable="TRUE")
         assert 'data-patch="false"' in self._row(patchable="False")
 
-    def test_data_expl_1_when_weaponized(self) -> None:
-        assert 'data-expl="1"' in self._row(hasVerifiedExploit="true")
-
-    def test_data_expl_0_when_no_exploit(self) -> None:
-        assert 'data-expl="0"' in self._row()
+    def test_data_expl_attribute_removed(self) -> None:
+        assert 'data-expl=' not in self._row(hasVerifiedExploit="true")
 
     def test_patch_icon_matches_state(self) -> None:
         assert "✅" in self._row(patchable="true")
@@ -338,3 +335,18 @@ class TestBuildHtmlEdgeCases:
         assert 'id="fSearch"' in html
         assert "function applyFilters(" in html
         assert "function cpy(" in html  # copy-to-clipboard buttons unaffected
+
+    def test_exploit_filter_has_granular_options(self, tmp_path: Path) -> None:
+        sum_p, exp_p = self._minimal_csvs(
+            tmp_path,
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "1", "Critical",
+              "9.8", "CVE-1", "CVE-1:Critical",
+              "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+            [["ns", "Deployment", "app", "r/a", "sha256:1", "v1", "CVE-1", "9.8",
+              "Critical", "", "", "", "", "", "", "", "", "", "", "", "", ""]],
+        )
+        ns = report.load_data(str(sum_p), str(exp_p))
+        html = report.build_html(ns)
+        assert '<option value="v">Verified only</option>' in html
+        assert '<option value="p">Published only</option>' in html
+        assert '<option value="k">In kit only</option>' in html

@@ -57,11 +57,10 @@ def _cve_row(cve: dict[str, Any]) -> str:
     v = "1" if _has_flag(cve, "hasVerifiedExploit") else "0"
     p = "1" if _has_flag(cve, "hasPublishedExploit") else "0"
     k = "1" if _has_flag(cve, "isInExploitKit") else "0"
-    expl = "1" if "1" in (v, p, k) else "0"
     return (
         f'<tr data-sev="{html.escape(sev, quote=True)}" '
         f'data-patch="{html.escape(patch, quote=True)}" '
-        f'data-expl="{expl}" data-v="{v}" data-p="{p}" data-k="{k}">'
+        f'data-v="{v}" data-p="{p}" data-k="{k}">'
         f'<td class="mono">{html.escape(cve["id"])}</td>'
         f'<td>{dot(sev)}{html.escape(sev)}</td>'
         f'<td>{badge(cve["score"])}</td>'
@@ -580,7 +579,10 @@ def build_html(namespaces):
     <label>Exploit
       <select id="fExpl" onchange="applyFilters()">
         <option value="">All</option>
-        <option value="1">Any exploit</option>
+        <option value="any">Any exploit</option>
+        <option value="v">Verified only</option>
+        <option value="p">Published only</option>
+        <option value="k">In kit only</option>
       </select>
     </label>
     <input type="text" id="fSearch" placeholder="Filter by namespace, repo, workload…" oninput="applyFilters()"/>
@@ -655,7 +657,10 @@ function applyFilters(){{
     var ok=true;
     if(sev&&row.dataset.sev!==sev)ok=false;
     if(patch&&row.dataset.patch!==patch)ok=false;
-    if(expl==='1'&&row.dataset.expl!=='1')ok=false;
+    if(expl==='any'&&!(row.dataset.v==='1'||row.dataset.p==='1'||row.dataset.k==='1'))ok=false;
+    if(expl==='v'&&row.dataset.v!=='1')ok=false;
+    if(expl==='p'&&row.dataset.p!=='1')ok=false;
+    if(expl==='k'&&row.dataset.k!=='1')ok=false;
     row.style.display=ok?'':'none';
   }});
   document.querySelectorAll('.card').forEach(function(card){{

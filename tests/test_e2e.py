@@ -158,7 +158,13 @@ def test_e2e_full_pipeline(
     # Data attributes on rows (so JS can filter)
     assert 'data-sev="Critical"' in html, "row data-sev missing"
     assert 'data-patch="true"' in html, "row data-patch missing"
-    assert 'data-expl="1"' in html or 'data-expl="0"' in html, "row data-expl missing"
+    # PR-UX-2 Task 3: single `data-expl` collapsed into 3 independent
+    # attributes so the exploit filter can isolate Verified / Published /
+    # In-kit individually. All three must be emitted so the JS filter
+    # (`applyFilters()`) has values to test against.
+    assert 'data-v="' in html, "row data-v missing (Verified exploit signal)"
+    assert 'data-p="' in html, "row data-p missing (Published exploit signal)"
+    assert 'data-k="' in html, "row data-k missing (In-Kit exploit signal)"
     # Cards must carry lowercased data-search for the free-text filter
     assert 'data-search="' in html, "card data-search missing"
 
