@@ -143,6 +143,57 @@ class TestCveRow:
         assert 'data-p="0"' in row
         assert 'data-k="1"' in row
 
+    def test_fix_status_and_age_included_in_row(self) -> None:
+        row = self._row(fixStatus="NoFix", cveAgeDays="120")
+        assert "NoFix" in row
+        assert ">120<" in row
+
+
+# ---------------------------------------------------------------------------
+# _fix_status_cell — Fix Status column (PR-UX-3 Task 4)
+# ---------------------------------------------------------------------------
+
+class TestFixStatusCell:
+    def test_renders_value(self) -> None:
+        assert "FixAvailable" in report._fix_status_cell({"fixStatus": "FixAvailable"})
+
+    def test_missing_value_shows_dash(self) -> None:
+        assert ">—<" in report._fix_status_cell({})
+
+    def test_html_escaped(self) -> None:
+        cell = report._fix_status_cell({"fixStatus": "<b>x</b>"})
+        assert "<b>" not in cell
+        assert "&lt;b&gt;" in cell
+
+
+# ---------------------------------------------------------------------------
+# _age_cell — CVE age (days) column (PR-UX-3 Task 4)
+# ---------------------------------------------------------------------------
+
+class TestAgeCell:
+    def test_renders_value(self) -> None:
+        assert ">45<" in report._age_cell({"cveAgeDays": "45"})
+
+    def test_missing_value_shows_dash(self) -> None:
+        assert ">—<" in report._age_cell({"cveAgeDays": ""})
+
+    def test_zero_is_not_treated_as_missing(self) -> None:
+        # `cveAgeDays="0"` is a real value (today), not missing — only
+        # whitespace/empty counts as missing.
+        assert ">0<" in report._age_cell({"cveAgeDays": "0"})
+
+
+# ---------------------------------------------------------------------------
+# _cve_table_head — deduped <thead> for both image and workload cards
+# ---------------------------------------------------------------------------
+
+class TestCveTableHead:
+    def test_columns_include_fix_status_and_age(self) -> None:
+        head = report._cve_table_head()
+        assert "<th>Fix Status</th>" in head
+        assert "<th>Age (days)</th>" in head
+        assert "<th>Exploit</th>" in head
+
 
 # ---------------------------------------------------------------------------
 # sev_class — score boundaries

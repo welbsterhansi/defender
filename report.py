@@ -67,6 +67,8 @@ def _cve_row(cve: dict[str, Any]) -> str:
         f'<td class="mono" style="font-size:.8em;color:#475569">{html.escape(pkg)}</td>'
         f'{_version_cell(cve)}'
         f'<td style="font-size:.8em;text-align:center">{patch_icon}</td>'
+        f'{_fix_status_cell(cve)}'
+        f'{_age_cell(cve)}'
         f'{_exploit_cell(cve)}'
         f'</tr>'
     )
@@ -93,6 +95,34 @@ def _version_cell(cve: dict[str, Any]) -> str:
         f'title="Copy `{payload_attr}`">⧉</button>'
         f'</td>'
     )
+
+
+def _cve_table_head() -> str:
+    """Shared `<thead>` for both the image-view and namespace-view CVE
+    tables — keeps the two render paths from drifting out of sync when
+    columns are added or reordered (PR-UX-3 Task 4)."""
+    cols = ["CVE ID", "Severity", "Score", "Package", "Current → Fixed",
+            "Patch", "Fix Status", "Age (days)", "Exploit"]
+    ths = "".join(f"<th>{c}</th>" for c in cols)
+    return f"<thead><tr>{ths}</tr></thead>"
+
+
+def _fix_status_cell(cve: dict[str, Any]) -> str:
+    """Render the Fix Status cell, defaulting to em-dash when absent.
+    Value comes straight from Defender's `fixStatus` field (already in
+    the CSV, previously loaded but never surfaced in the report)."""
+    value = html.escape(str(cve.get("fixStatus", "") or "—"))
+    return f'<td style="font-size:.8em;text-align:center">{value}</td>'
+
+
+def _age_cell(cve: dict[str, Any]) -> str:
+    """Render the CVE age-in-days cell, defaulting to em-dash when absent.
+    `cveAgeDays="0"` is a real value (found today), not a missing one —
+    only an empty/whitespace string counts as missing so freshly-published
+    CVEs are visibly distinguished from ones we have no age data for."""
+    age_raw = str(cve.get("cveAgeDays", "") or "").strip()
+    value = html.escape(age_raw) if age_raw else "—"
+    return f'<td style="font-size:.8em;text-align:center">{value}</td>'
 
 
 def _new_cve_agg() -> dict[str, Any]:
@@ -332,7 +362,7 @@ def build_html(namespaces):
           <div class="card-body"{body_style}>
             <div class="runs-in"><strong>Runs in:</strong> {runs_in}</div>
             <table class="cve-tbl">
-              <thead><tr><th>CVE ID</th><th>Severity</th><th>Score</th><th>Package</th><th>Current → Fixed</th><th>Patch</th><th>Exploit</th></tr></thead>
+              {_cve_table_head()}
               <tbody>{cve_rows}</tbody>
             </table>
           </div>
@@ -372,7 +402,7 @@ def build_html(namespaces):
                 <span class="mono img-repo">{html.escape(w["repo"])}</span>{tag_span}<span class="digest-t">@{digest_s}</span>
               </div>
               <table class="cve-tbl">
-                <thead><tr><th>CVE ID</th><th>Severity</th><th>Score</th><th>Package</th><th>Current → Fixed</th><th>Patch</th><th>Exploit</th></tr></thead>
+                {_cve_table_head()}
                 <tbody>{cve_trs}</tbody>
               </table>
             </div>'''
