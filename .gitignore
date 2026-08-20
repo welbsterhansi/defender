@@ -20,6 +20,7 @@ resultado_cruzamento.csv
 expanded.csv
 vulnerability_report.html
 logs/
+probes/
 
 # macOS
 .DS_Store
