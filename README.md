@@ -96,6 +96,22 @@ make clean   # remove generated CSVs, HTML, caches
 
 Tests run entirely offline against synthetic CSV fixtures generated in `tests/conftest.py` — no live Azure or OpenShift calls. See `tests/test_e2e.py` for the full-pipeline integration test.
 
+## Data source (post-2026-07-31)
+
+Microsoft retired the legacy grouped `microsoft.security/assessments/subassessments` type on **2026-07-31**. `defender.sh` was migrated to the individual-recommendations model in August 2026:
+
+- **Single leg** against `microsoft.security/assessments` filtered by `recommendationCategory == "SoftwareUpdate"` + `resourceDetails.ResourceType == ".containerimage"` + `Source == "Azure"`.
+- All CVE fields (severity, CVSS, exploit signals, published date, description, fix status) are read inline from `properties.additionalData.CvesDetails[]`.
+- Image identity comes from `properties.resourceAdditionalData.RepositoryDetails.*` and `.Digest`.
+- Package version comes from `properties.additionalData.ScannersDetails.mdvm.*`.
+- CSV column order is unchanged — downstream (`expandcsv.py`, `group_findings.py`, `report.py`) is untouched.
+
+Details, path map, and rationale: [`docs/mdvm-individual-migration.md`](./docs/mdvm-individual-migration.md).
+
+### Known limitation — repo-level data quality on the Microsoft side
+
+Some repositories (observed with base OS images and similar system-level layers) return CVEs with `Severity == "Unknown"` and no `Cvss[0].Value.Base` populated. In those cases the row falls to `cvssScore = 0.0` and is filtered out by `--min-score`. This is a Microsoft-side data-population gap in the individual model (see [Azure/Microsoft-Defender-for-Cloud#1056](https://github.com/Azure/Microsoft-Defender-for-Cloud/issues/1056)) — no code change on our side can invent severity values that Defender didn't emit. Run `--debug` to see the diagnostic aggregate; if entire repos show `sev_unknown` = 100%, that's the symptom.
+
 ## Manual smoke test (real Azure/OpenShift)
 
 Use this to sanity-check a real environment. **Always report-only.** Never pass `--block-images` or `--unblock*` without explicit team approval.

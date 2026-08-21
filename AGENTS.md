@@ -96,7 +96,7 @@ python3 report.py
 
 ## Constraints
 
-- **Do not modify the KQL query in `defender.sh`.** It is tuned for a specific Defender for Cloud subscription shape and covers both MDVM (`c0b7cfc6-...`) and legacy `SoftwareUpdate` assessments. Adjust the surrounding shell logic (parsing, resilience, output) freely.
+- **KQL in `defender.sh` was rewritten 2026-08 for the MDVM individual-recommendations migration.** Microsoft retired the legacy grouped `microsoft.security/assessments/subassessments` type (with the `c0b7cfc6-...` assessment key) on 2026-07-31. The current single-leg query reads from the individual model at `microsoft.security/assessments` with `recommendationCategory == "SoftwareUpdate"` + `.containerimage` + `Source == "Azure"`, and pulls CVE fields inline from `properties.additionalData.CvesDetails[]` (no cross-resource JOIN — `microsoft.security/cvedetails` is empty in target tenants). See `docs/mdvm-individual-migration.md` for the full path map and rationale. Any change to the KQL must keep the 31 TDD invariants in `tests/test_defender_query_migration.py` green.
 - Preserve the existing CSV column order — downstream stages depend on positional and named lookups.
 - HTML output is single-file (embedded CSS, no external assets beyond Google Fonts) so it can be emailed or dropped into a wiki.
 
