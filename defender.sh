@@ -801,13 +801,13 @@ QUERY_FILE=$(mktemp)
 # REPORT_TMP so the trap leaves the final report in place.
 trap 'rm -f "$QUERY_FILE" ${REPORT_TMP:+"$REPORT_TMP"}' EXIT
 
-# Pre-compute early filter snippets to inject INSIDE each leg before extends/mv-expand.
-# This lets ARG push the filters down and avoid scanning the whole subscription.
-EARLY_FILTER_A=""
+# Pre-compute early filter snippet for the single (post-migration) query leg.
+# This lets ARG push the filter down so we don't scan the whole subscription.
+# Historical note: pre-2026-07-31 there was a second filter EARLY_FILTER_A for
+# the retired subassessments leg — removed with that leg.
 EARLY_FILTER_B=""
 
 if [ -n "$SCAN_REPOSITORY" ]; then
-    EARLY_FILTER_A="| where properties.additionalData.artifactDetails.repositoryName == \"$SCAN_REPOSITORY\""
     _REPO_DASHED=$(repo_to_dashed_path "$SCAN_REPOSITORY")
     EARLY_FILTER_B="| where properties.resourceDetails.Id contains \"$_REPO_DASHED\""
     if [ -n "$SCAN_DIGEST" ]; then
@@ -815,154 +815,144 @@ if [ -n "$SCAN_REPOSITORY" ]; then
         EARLY_FILTER_B="$EARLY_FILTER_B and properties.resourceDetails.Id contains \"$_DIGEST_HEX\""
     fi
 elif [ -n "$REPOSITORY" ]; then
-    EARLY_FILTER_A="| where properties.additionalData.artifactDetails.repositoryName contains \"$REPOSITORY\""
     _REPO_DASHED=$(repo_to_dashed_path "$REPOSITORY")
     EARLY_FILTER_B="| where properties.resourceDetails.Id contains \"$_REPO_DASHED\""
 elif [ -n "$REPOSITORIES" ]; then
-    # CONTROLLED list semantics (task #38): exact match, not substring.
-    # Leg A uses KQL `in (...)`. Leg B uses `contains "repositories-<dashed>-images-"`
-    # — the `repositories-…-images-` bracketing is the exact-match anchor for
-    # the SoftwareUpdate `resourceDetails.Id` format, so `app` never captures
-    # `myapp` or `app-backend`.
+    # CONTROLLED list semantics: exact match, not substring. Uses
+    # `contains "repositories-<dashed>-images-"` — the bracketing is the
+    # exact-match anchor for the SoftwareUpdate `resourceDetails.Id` format,
+    # so `app` never captures `myapp` or `app-backend`.
     mapfile -t _repos_list < <(parse_repo_list "$REPOSITORIES")
-    _expr_a=$(build_repos_in_expr \
-        "properties.additionalData.artifactDetails.repositoryName" \
-        "${_repos_list[@]}")
-    EARLY_FILTER_A="| where $_expr_a"
     _expr_b=$(build_repos_id_anchor_expr \
         "properties.resourceDetails.Id" \
         "${_repos_list[@]}")
     EARLY_FILTER_B="| where $_expr_b"
 fi
 
-# Union of both assessment shapes to ensure full coverage:
-# Leg A: MDVM subassessments (c0b7cfc6-... key) — preferred schema with rich fields.
-# Leg B: Grouped SoftwareUpdate assessments — still populated in many ACR environments.
+# MDVM individual-recommendations model (post-2026-07-31 migration).
+#
+# Microsoft retired the legacy grouped `subassessments` type on 2026-07-31 —
+# the old "Leg A" (subassessments + c0b7cfc6-… assessment key) returns zero
+# rows now. This single leg queries the individual-recommendations model
+# Microsoft documents as the replacement for ACR containers.
+# See docs/investigation-mdvm-2026-08.md and the MS transition reference:
+# https://learn.microsoft.com/en-us/azure/defender-for-cloud/transition-grouped-individual-recommendations
+#
+# Casing note: Microsoft emits some `additionalData` fields as PascalCase
+# and some as camelCase across rows in the individual model. Every read of
+# a field that varies is wrapped in `coalesce(PascalCase, camelCase)` —
+# pattern validated in the community SQL VA migration
+# (Azure/Microsoft-Defender-for-Cloud PR#1047, merged 2026-07-02).
 cat > "$QUERY_FILE" << ENDQUERY
 securityresources
-| where type =~ "microsoft.security/assessments/subassessments"
-| where id contains "/assessments/c0b7cfc6-3172-465a-b378-53c7ff2cc0d5/"
-$EARLY_FILTER_A
+| where type == "microsoft.security/assessments"
+| where properties.metadata.recommendationCategory == "SoftwareUpdate"
+| where properties.resourceDetails.ResourceType == ".containerimage"
+| where properties.resourceDetails.Source == "Azure"
+$EARLY_FILTER_B
+| extend _resourceId = tolower(coalesce(
+    tostring(properties.resourceDetails.Id),
+    tostring(properties.resourceDetails.id),
+    extract("(.+)/providers/Microsoft.Security", 1, tostring(id))
+  ))
+| where isnotempty(_resourceId)
 | extend
-    cveId = tostring(properties.id),
+    _rad = parse_json(tostring(properties.resourceAdditionalData)),
+    _dashedPath = extract(@"repositories-(.+)-images-sha256:[a-f0-9]+", 1, _resourceId),
+    _resourceName = tostring(properties.resourceDetails.ResourceName),
+    _digest = strcat("sha256:", extract(@"sha256:([a-f0-9]+)", 1, _resourceId)),
+    _cvesJson = parse_json(tostring(coalesce(
+        properties.additionalData.CvesDetails,
+        properties.additionalData.cvesDetails
+    ))),
+    _pkgCategory = tostring(coalesce(
+        properties.additionalData.PackageType,
+        properties.additionalData.packageType
+    )),
+    _pkgLanguage = tostring(coalesce(
+        properties.additionalData.Language,
+        properties.additionalData.language
+    )),
+    _pkgName = tostring(coalesce(
+        properties.additionalData.SoftwareName,
+        properties.additionalData.softwareName
+    )),
+    _detectedVersion = tostring(coalesce(
+        properties.additionalData.DetectedSoftwareVersions,
+        properties.additionalData.detectedSoftwareVersions
+    )),
+    _topSeverity = tostring(coalesce(
+        properties.metadata.severity,
+        properties.status.severity
+    ))
+| mv-expand cve = _cvesJson
+| extend
+    cveId = tostring(coalesce(cve.CveId, cve.cveId)),
+    _cveSeverity = tostring(coalesce(cve.Severity, cve.severity)),
+    _cveFixStatus = tostring(coalesce(cve.FixStatus, cve.fixStatus)),
+    _cvePublished = coalesce(cve.PublishedDate, cve.publishedDate)
+| extend
     cvssScore = coalesce(
-        todouble(properties.additionalData.cvssV30Score),
+        todouble(coalesce(cve.Cvss[0].Value.Base, cve.cvss[0].value.base)),
         case(
-            properties.additionalData.vulnerabilityDetails.severity =~ "Critical", 9.0,
-            properties.additionalData.vulnerabilityDetails.severity =~ "High",     7.0,
-            properties.additionalData.vulnerabilityDetails.severity =~ "Medium",   4.0,
-            properties.additionalData.vulnerabilityDetails.severity =~ "Low",      0.1,
+            _cveSeverity =~ "Critical", 9.0,
+            _cveSeverity =~ "High",     7.0,
+            _cveSeverity =~ "Medium",   4.0,
+            _cveSeverity =~ "Low",      0.1,
             0.0
         )
     ),
-    digest = tostring(properties.additionalData.artifactDetails.digest),
-    repository = tostring(properties.additionalData.artifactDetails.repositoryName),
-    lastPushedToRegistryUTC = tostring(properties.additionalData.artifactDetails.lastPushedToRegistryUTC),
-    packageCategory = tostring(properties.additionalData.softwareDetails.category),
-    packageLanguage = tostring(properties.additionalData.softwareDetails.language),
-    packageName = tostring(properties.additionalData.softwareDetails.packageName),
-    currentVersion = tostring(properties.additionalData.softwareDetails.version),
-    fixedVersion = coalesce(
-        tostring(properties.additionalData.softwareDetails.fixedVersion),
-        tostring(properties.additionalData.vulnerabilityDetails.fixedVersion)
+    repository = iff(
+        _dashedPath == _resourceName,
+        _resourceName,
+        strcat(substring(_dashedPath, 0, strlen(_dashedPath) - strlen(_resourceName) - 1), "/", _resourceName)
     ),
+    digest = _digest,
+    severityRaw = coalesce(_cveSeverity, _topSeverity),
+    packageCategory = _pkgCategory,
+    packageLanguage = _pkgLanguage,
+    packageName = _pkgName,
+    currentVersion = _detectedVersion,
+    fixedVersion = tostring(coalesce(cve.FixedVersion, cve.fixedVersion)),
     patchable = case(
-        tostring(properties.additionalData.softwareDetails.fixStatus) =~ "FixAvailable", "true",
-        tostring(properties.additionalData.softwareDetails.fixStatus) in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
-        isnotnull(properties.additionalData.patchable), tostring(properties.additionalData.patchable),
-        isnotnull(properties.additionalData.vulnerabilityDetails.isPatchable), tostring(properties.additionalData.vulnerabilityDetails.isPatchable),
+        _cveFixStatus =~ "FixAvailable", "true",
+        _cveFixStatus in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
         ""
     ),
-    remediation = tostring(properties.remediation),
-    severityRaw = tostring(properties.status.severity),
-    fixStatus = tostring(properties.additionalData.softwareDetails.fixStatus),
+    remediation = tostring(coalesce(cve.Description, cve.description)),
+    fixStatus = _cveFixStatus,
     cveAgeDays = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.publishedDate),
-        datetime_diff('day', now(), todatetime(properties.additionalData.vulnerabilityDetails.publishedDate)),
+        isnotnull(_cvePublished),
+        datetime_diff('day', now(), todatetime(_cvePublished)),
         long(-1)
     ),
     isInExploitKit = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.isInExploitKit)
-            and tobool(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.isInExploitKit),
+        isnotnull(coalesce(cve.ExploitabilityDetails.IsInExploitKit,
+                           cve.exploitabilityDetails.isInExploitKit))
+            and tobool(coalesce(cve.ExploitabilityDetails.IsInExploitKit,
+                                cve.exploitabilityDetails.isInExploitKit)),
         "true", "false"
     ),
     hasPublishedExploit = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsPublished)
-            and tobool(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsPublished),
+        isnotnull(coalesce(cve.ExploitabilityDetails.ExploitStepsPublished,
+                           cve.exploitabilityDetails.exploitStepsPublished))
+            and tobool(coalesce(cve.ExploitabilityDetails.ExploitStepsPublished,
+                                cve.exploitabilityDetails.exploitStepsPublished)),
         "true", "false"
     ),
     hasVerifiedExploit = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsVerified)
-            and tobool(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsVerified),
+        isnotnull(coalesce(cve.ExploitabilityDetails.ExploitStepsVerified,
+                           cve.exploitabilityDetails.exploitStepsVerified))
+            and tobool(coalesce(cve.ExploitabilityDetails.ExploitStepsVerified,
+                                cve.exploitabilityDetails.exploitStepsVerified)),
         "true", "false"
-    )
+    ),
+    lastPushedToRegistryUTC = tostring(coalesce(
+        _rad.LastPushedToRegistryUTC,
+        _rad.lastPushedToRegistryUTC
+    ))
 | where cveId startswith "CVE-" and cvssScore >= $MIN_SCORE and cvssScore <= $MAX_SCORE
 | project repository, digest, cvssScore, cveId, severityRaw, packageCategory, packageLanguage, packageName, currentVersion, fixedVersion, patchable, remediation, fixStatus, cveAgeDays, isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC
-| union (securityresources
-    | where type =~ "microsoft.security/assessments"
-    | where properties.metadata.recommendationCategory == "SoftwareUpdate"
-    | where properties.resourceDetails.ResourceType == ".containerimage"
-    | where properties.resourceDetails.Source == "Azure"
-    $EARLY_FILTER_B
-    | extend
-        _rad = parse_json(tostring(properties.resourceAdditionalData)),
-        _dashedPath = extract(@"repositories-(.+)-images-sha256:[a-f0-9]+", 1, tostring(properties.resourceDetails.Id)),
-        _resourceName = tostring(properties.resourceDetails.ResourceName),
-        _digest = strcat("sha256:", extract(@"sha256:([a-f0-9]+)", 1, tostring(properties.resourceDetails.Id))),
-        _cvesJson = parse_json(tostring(properties.additionalData.CvesDetails)),
-        _pkgCategory = tostring(properties.additionalData.PackageType),
-        _pkgLanguage = tostring(properties.additionalData.Language),
-        _pkgName = tostring(properties.additionalData.SoftwareName)
-    | mv-expand cve = _cvesJson
-    | extend
-        cveId = tostring(cve.CveId),
-        cvssScore = coalesce(
-            todouble(cve.Cvss[0].Value.Base),
-            case(
-                cve.Severity =~ "Critical", 9.0,
-                cve.Severity =~ "High",     7.0,
-                cve.Severity =~ "Medium",   4.0,
-                cve.Severity =~ "Low",      0.1,
-                0.0
-            )
-        ),
-        repository = iff(
-            _dashedPath == _resourceName,
-            _resourceName,
-            strcat(substring(_dashedPath, 0, strlen(_dashedPath) - strlen(_resourceName) - 1), "/", _resourceName)
-        ),
-        severityRaw = tostring(cve.Severity),
-        fixStatus = tostring(cve.FixStatus),
-        fixedVersion = tostring(cve.FixedVersion),
-        patchable = case(
-            tostring(cve.FixStatus) =~ "FixAvailable", "true",
-            tostring(cve.FixStatus) in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
-            ""
-        ),
-        remediation = tostring(cve.Description),
-        cveAgeDays = iff(
-            isnotnull(cve.PublishedDate),
-            datetime_diff('day', now(), todatetime(cve.PublishedDate)),
-            long(-1)
-        ),
-        isInExploitKit = iff(
-            isnotnull(cve.ExploitabilityDetails.IsInExploitKit)
-                and tobool(cve.ExploitabilityDetails.IsInExploitKit),
-            "true", "false"
-        ),
-        hasPublishedExploit = iff(
-            isnotnull(cve.ExploitabilityDetails.ExploitStepsPublished)
-                and tobool(cve.ExploitabilityDetails.ExploitStepsPublished),
-            "true", "false"
-        ),
-        hasVerifiedExploit = iff(
-            isnotnull(cve.ExploitabilityDetails.ExploitStepsVerified)
-                and tobool(cve.ExploitabilityDetails.ExploitStepsVerified),
-            "true", "false"
-        ),
-        lastPushedToRegistryUTC = tostring(_rad.LastPushedToRegistryUTC)
-    | where cveId startswith "CVE-" and cvssScore >= $MIN_SCORE and cvssScore <= $MAX_SCORE
-    | project repository, digest=_digest, cvssScore, cveId, severityRaw, packageCategory=_pkgCategory, packageLanguage=_pkgLanguage, packageName=_pkgName, currentVersion="", fixedVersion, patchable, remediation, fixStatus, cveAgeDays, isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC)
 ENDQUERY
 
 # Final projection and ordering
@@ -980,8 +970,13 @@ if [ "$DEBUG" = true ]; then
     echo ""
     echo "=== [DEBUG] Diagnóstico ARG — repositórios encontrados (sem filtro de score) ==="
     _REPO_FILTER=""
-    [ -n "$REPOSITORY" ] && _REPO_FILTER="| where properties.additionalData.artifactDetails.repositoryName contains \"$REPOSITORY\""
-    az graph query -q "securityresources | where type =~ 'microsoft.security/assessments/subassessments' | where id contains '/assessments/c0b7cfc6-3172-465a-b378-53c7ff2cc0d5/' $_REPO_FILTER | extend repository = tostring(properties.additionalData.artifactDetails.repositoryName), cvssScore = todouble(properties.additionalData.cvssV30Score) | summarize cve_count=count(), max_cvss=max(cvssScore), min_cvss=min(cvssScore) by repository | order by max_cvss desc" --output table 2>&1 || echo "[DEBUG] az graph query falhou"
+    if [ -n "$REPOSITORY" ]; then
+        _REPO_DASHED_DEBUG=$(repo_to_dashed_path "$REPOSITORY")
+        _REPO_FILTER="| where properties.resourceDetails.Id contains \"$_REPO_DASHED_DEBUG\""
+    fi
+    # Post-migration (2026-07-31): subassessments retired. Diagnostic now uses
+    # the individual-recommendations model, same entry point as the main query.
+    az graph query -q "securityresources | where type == 'microsoft.security/assessments' | where properties.metadata.recommendationCategory == 'SoftwareUpdate' | where properties.resourceDetails.ResourceType == '.containerimage' | where properties.resourceDetails.Source == 'Azure' $_REPO_FILTER | extend _rname = tostring(properties.resourceDetails.ResourceName), _cves = parse_json(tostring(coalesce(properties.additionalData.CvesDetails, properties.additionalData.cvesDetails))) | mv-expand cve = _cves | extend _cvss = todouble(coalesce(cve.Cvss[0].Value.Base, cve.cvss[0].value.base)) | summarize cve_count = count(), max_cvss = max(_cvss), min_cvss = min(_cvss) by _rname | order by max_cvss desc" --output table 2>&1 || echo "[DEBUG] az graph query falhou"
     echo ""
 fi
 echo "Executing Azure Resource Graph query..."
