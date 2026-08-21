@@ -5,7 +5,7 @@
 # Purpose (investigation, 2026-08):
 #   Microsoft retired legacy grouped container vulnerability recommendations
 #   (sub-assessments) on 2026-07-31 — the exact shape defender.sh's KQL depends
-#   on for Leg A (c0b7cfc6-…). This probe runs FOUR read-only Azure Resource
+#   on for Leg A (c0b7cfc6-…). This probe runs FIVE read-only Azure Resource
 #   Graph queries to gather the raw evidence needed to design the migration
 #   safely, WITHOUT modifying defender.sh, its KQL, or any CSV.
 #
@@ -16,13 +16,19 @@
 #   - Absolutely read-only against Azure Resource Graph.
 #
 # Output:
-#   Writes 4 JSON files to an output directory (default ./probes/probe-<ts>/).
+#   Writes 5 JSON files to an output directory (default ./probes/probe-<ts>/).
 #   probe-1: legacy sub-assessment row count (expected ~0 after retirement)
-#   probe-2: recommendation UUIDs currently emitting for ACR (individual model)
+#   probe-2: recommendation UUIDs currently emitting for ACR — with per-known-UUID
+#            breakdown (c0b7cfc6, 33422d8f, c609cf0f from the MS transition doc)
+#            plus any unknown-new UUIDs Microsoft added
 #   probe-3: 3 raw assessments — CONTAINS CLIENT REPO/DIGEST DATA, do not share
 #   probe-4: presence check for every schema path defender.sh currently uses,
 #            plus the paths speculated by other analyses (cvssV31, fixState,
 #            exploitUrisPublished, vulnerabilityDetails.cvssV3Score, …)
+#   probe-5: bag_keys discovery — enumerates ALL keys present under each
+#            subtree (additionalData, CvesDetails[], vulnerabilityDetails,
+#            softwareDetails, artifactDetails). Catches unknown-unknowns
+#            such as new fields for EPSS, KEV listing, exploit maturity.
 #
 # Usage:
 #   scripts/probe-mdvm-individual.sh --acr-name <ACR>
@@ -42,7 +48,7 @@ REPOSITORY=""
 OUT_DIR=""
 
 usage() {
-    sed -n '3,40p' "$0"
+    sed -n '3,42p' "$0"
     exit "${1:-0}"
 }
 
@@ -134,10 +140,16 @@ run_probe "[1/4] Legacy sub-assessments count (c0b7cfc6-...)" \
 
 # ---------------------------------------------------------------------------
 # Probe 2: which recommendation UUIDs are actually emitting today for
-# .containerimage / Source=Azure? The individual-recommendations model
-# replaces c0b7cfc6-… with one-or-more new UUIDs — this shows which.
+# .containerimage / Source=Azure? Per the MS transition doc, THREE UUIDs
+# now cover ACR containers under SoftwareUpdate (was one grouped UUID):
+#   - c0b7cfc6-...  Azure registry container images should have vulnerabilities resolved
+#   - 33422d8f-...  Container images in Azure registry should have vulnerability findings resolved
+#   - c609cf0f-...  Azure running container images should have vulnerabilities resolved
+# We list ALL UUIDs (not filtered) plus a per-known-UUID row count, so any
+# 4th UUID Microsoft adds later shows up too.
+# Ref: https://learn.microsoft.com/en-us/azure/defender-for-cloud/transition-grouped-individual-recommendations
 # ---------------------------------------------------------------------------
-run_probe "[2/4] Recommendation UUIDs emitting for ACR (individual model)" \
+run_probe "[2/5] Recommendation UUIDs emitting for ACR (all + known-3 breakdown)" \
     "probe-2-assessment-ids.json" \
     "securityresources
     | where type == 'microsoft.security/assessments'
@@ -146,7 +158,13 @@ run_probe "[2/4] Recommendation UUIDs emitting for ACR (individual model)" \
     | where properties.resourceDetails.Source == 'Azure'
     ${REPO_FILTER}
     | extend assessmentId = extract('/assessments/([^/]+)', 1, tolower(tostring(id)))
-    | summarize rows = count() by assessmentId
+    | extend knownUuid = case(
+        assessmentId == 'c0b7cfc6-3172-465a-b378-53c7ff2cc0d5', 'c0b7cfc6-acr-registry',
+        assessmentId == '33422d8f-ab1e-42be-bc9a-38685bb567b9', '33422d8f-acr-registry-v2',
+        assessmentId == 'c609cf0f-71ab-41e9-a3c6-9a1f7fe1b8d5', 'c609cf0f-acr-running',
+        'unknown-new-uuid'
+      )
+    | summarize rows = count() by assessmentId, knownUuid
     | order by rows desc"
 
 # ---------------------------------------------------------------------------
@@ -156,7 +174,7 @@ run_probe "[2/4] Recommendation UUIDs emitting for ACR (individual model)" \
 # the client's registry — treat it as sensitive and do not paste externally
 # without redaction.
 # ---------------------------------------------------------------------------
-run_probe "[3/4] Raw sample (3 assessments — CONTAINS CLIENT DATA)" \
+run_probe "[3/5] Raw sample (3 assessments — CONTAINS CLIENT DATA)" \
     "probe-3-raw-sample.json" \
     "securityresources
     | where type == 'microsoft.security/assessments'
@@ -172,7 +190,7 @@ run_probe "[3/4] Raw sample (3 assessments — CONTAINS CLIENT DATA)" \
 # uses AND the renamed paths speculated by other analyses. Zero on the
 # old path + non-zero on the new path = confirmed rename. No guessing.
 # ---------------------------------------------------------------------------
-run_probe "[4/4] Schema path presence (old vs speculated new)" \
+run_probe "[4/5] Schema path presence (old vs speculated new)" \
     "probe-4-field-presence.json" \
     "securityresources
     | where type == 'microsoft.security/assessments'
@@ -197,7 +215,85 @@ run_probe "[4/4] Schema path presence (old vs speculated new)" \
         tem_metadata_severity            = countif(isnotnull(properties.metadata.severity)),
         tem_status_severity              = countif(isnotnull(properties.status.severity))"
 
+# ---------------------------------------------------------------------------
+# Probe 5: discovery via bag_keys.
+# probe-4 is an ALLOWLIST — it only reports paths we thought to ask about.
+# If Microsoft added a brand-new field (e.g. EPSS score, KEV listing,
+# exploit maturity, package purl), probe-4 misses it silently.
+# This probe enumerates the actual keys present under each subtree and
+# aggregates by frequency. Zero writes, aggregations only.
+#
+# Output shape per row: subtree | key | rows_with_key
+#   subtree = one of additionalData / additionalData.CvesDetails[] /
+#             vulnerabilityDetails / softwareDetails / artifactDetails
+#   key     = a top-level property name found under that subtree
+#   rows    = how many assessments populated that key (higher = more
+#             widespread, likely to matter for the migration design)
+# ---------------------------------------------------------------------------
+run_probe "[5/5] Key discovery via bag_keys (finds unknown-unknowns)" \
+    "probe-5-bag-keys.json" \
+    "securityresources
+    | where type == 'microsoft.security/assessments'
+    | where properties.metadata.recommendationCategory == 'SoftwareUpdate'
+    | where properties.resourceDetails.ResourceType == '.containerimage'
+    | where properties.resourceDetails.Source == 'Azure'
+    ${REPO_FILTER}
+    | extend
+        _ad  = properties.additionalData,
+        _vd  = properties.additionalData.vulnerabilityDetails,
+        _sd  = properties.additionalData.softwareDetails,
+        _art = properties.additionalData.artifactDetails,
+        _cveArr = parse_json(tostring(properties.additionalData.CvesDetails))
+    | mv-expand _cveObj = _cveArr
+    | mv-apply k_ad  = bag_keys(_ad)  on (extend subtree='additionalData',                key=tostring(k_ad))
+    | union (
+        securityresources
+        | where type == 'microsoft.security/assessments'
+        | where properties.metadata.recommendationCategory == 'SoftwareUpdate'
+        | where properties.resourceDetails.ResourceType == '.containerimage'
+        | where properties.resourceDetails.Source == 'Azure'
+        ${REPO_FILTER}
+        | extend _cveArr = parse_json(tostring(properties.additionalData.CvesDetails))
+        | mv-expand _cveObj = _cveArr
+        | mv-apply k_cve = bag_keys(_cveObj) on (extend subtree='additionalData.CvesDetails[]', key=tostring(k_cve))
+      )
+    | union (
+        securityresources
+        | where type == 'microsoft.security/assessments'
+        | where properties.metadata.recommendationCategory == 'SoftwareUpdate'
+        | where properties.resourceDetails.ResourceType == '.containerimage'
+        | where properties.resourceDetails.Source == 'Azure'
+        ${REPO_FILTER}
+        | extend _vd = properties.additionalData.vulnerabilityDetails
+        | where isnotnull(_vd)
+        | mv-apply k_vd = bag_keys(_vd) on (extend subtree='additionalData.vulnerabilityDetails', key=tostring(k_vd))
+      )
+    | union (
+        securityresources
+        | where type == 'microsoft.security/assessments'
+        | where properties.metadata.recommendationCategory == 'SoftwareUpdate'
+        | where properties.resourceDetails.ResourceType == '.containerimage'
+        | where properties.resourceDetails.Source == 'Azure'
+        ${REPO_FILTER}
+        | extend _sd = properties.additionalData.softwareDetails
+        | where isnotnull(_sd)
+        | mv-apply k_sd = bag_keys(_sd) on (extend subtree='additionalData.softwareDetails', key=tostring(k_sd))
+      )
+    | union (
+        securityresources
+        | where type == 'microsoft.security/assessments'
+        | where properties.metadata.recommendationCategory == 'SoftwareUpdate'
+        | where properties.resourceDetails.ResourceType == '.containerimage'
+        | where properties.resourceDetails.Source == 'Azure'
+        ${REPO_FILTER}
+        | extend _art = properties.additionalData.artifactDetails
+        | where isnotnull(_art)
+        | mv-apply k_art = bag_keys(_art) on (extend subtree='additionalData.artifactDetails', key=tostring(k_art))
+      )
+    | summarize rows_with_key = count() by subtree, key
+    | order by subtree asc, rows_with_key desc"
+
 echo >&2
 echo "Done." >&2
-echo "Next: share $OUT_DIR/probe-{1,2,4}.json here (probes 1, 2 and 4 are aggregations — safe)." >&2
+echo "Next: share $OUT_DIR/probe-{1,2,4,5}.json here (probes 1, 2, 4, 5 are aggregations — safe)." >&2
 echo "      probe-3-raw-sample.json contains client data — inspect locally with jq, share only redacted excerpts." >&2
