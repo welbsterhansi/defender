@@ -2,38 +2,31 @@
 TDD invariants for the MDVM individual-recommendations migration.
 
 Microsoft retired the legacy `microsoft.security/assessments/subassessments`
-type on 2026-07-31 (see docs/investigation-mdvm-2026-08.md). The new
-individual-recommendations model for ACR containers has a schema that
-Microsoft never documented publicly for containers — the actual paths
-below were determined empirically by running a probe query at the client's
-tenant, then confirmed with a working end-to-end query from the client team.
+type on 2026-07-31 (see docs/investigation-mdvm-2026-08.md). The individual
+model for ACR containers stores CVE-level data INLINE inside
+`properties.additionalData.CvesDetails[]` — the same structure the
+pre-migration Leg B already used. There is NO cross-resource JOIN needed
+in this tenant (an earlier attempt to JOIN with `microsoft.security/cvedetails`
+returned zero matches because that resource type is not populated here).
 
-Key schema facts (from the client-validated probe):
+Empirically validated `cve.*` bag keys (from a probe run at the client):
 
-* CVE-level data is **split across two resource types**:
-  - `microsoft.security/assessments` (this leg) → carries `CvesDetails[]`,
-    which is now essentially just an array of `{CveId}`.
-  - `microsoft.security/cvedetails` (JOIN target) → carries `severity`,
-    `cvss[<version>].base`, `publishedDate`, `exploitabilityDetails.*`,
-    `description`, `remediation`. Joined on `CveId`.
+    ["CveId", "AdditionalIdentifiers", "Description", "ExtendedDescription",
+     "Cvss", "CvssSource", "Severity", "PublishedDate", "LastModifiedDate",
+     "Weaknesses", "FixStatus", "FixedVersion", "ExploitabilityDetails",
+     "References", "Tags"]
 
-* Package version comes from `additionalData.ScannersDetails.mdvm.*` —
-  neither top-level `additionalData` nor inside `CvesDetails[]`.
+CVSS is an array of Key/Value objects, e.g.
+    [{"Key": "3", "Value": {"Base": 7.1, "CvssVectorString": "..."}}]
+so numeric extraction is `todouble(cve.Cvss[0].Value.Base)`.
 
-* Image identity (repo, digest, registry) comes from
-  `resourceAdditionalData.RepositoryDetails.*` and
-  `resourceAdditionalData.Digest` — clean structured fields, no URL regex
-  needed anymore.
+Image identity comes from `properties.resourceAdditionalData.RepositoryDetails.*`
+(clean structured fields — no URL regex extraction).
 
-* CVSS supports 4.0/3.1/3.0/2.0 with string keys: `cvss["4.0"].base`.
-
-* Exploit signals were renamed under `cvedetails.exploitabilityDetails.*`:
-  - `IsInExploitKit` (unchanged)
-  - `IsPubliclyDisclosed` (was `ExploitStepsPublished`)
-  - `IsVerified` (was `ExploitStepsVerified`)
+Package version comes from `properties.additionalData.ScannersDetails.mdvm.*`.
 
 These tests inspect the KQL heredoc embedded in `defender.sh` (they do NOT
-run `az`) and enforce the invariants above so any regression is caught in CI.
+run `az`) and enforce the invariants so any regression is caught in CI.
 """
 
 from __future__ import annotations
@@ -103,8 +96,7 @@ def _coalesce_contains_all(kql: str, *substrings: str) -> bool:
 class TestSubassessmentsGone:
     def test_kql_has_no_subassessments_type(self, kql: str) -> None:
         assert "subassessments" not in kql.lower(), (
-            "Leg A (microsoft.security/assessments/subassessments) is retired — "
-            "must be removed from the main KQL"
+            "Leg A (microsoft.security/assessments/subassessments) is retired"
         )
 
     def test_kql_has_no_legacy_c0b7cfc6_filter(self, kql: str) -> None:
@@ -148,37 +140,88 @@ class TestIndividualModelEntryPoint:
 
 
 # ---------------------------------------------------------------------------
-# 3. Two-resource JOIN structure — CVE data lives in microsoft.security/cvedetails
+# 3. No JOIN with cvedetails — the resource type is empty in target tenants
 # ---------------------------------------------------------------------------
 
 
-class TestCveDetailsJoin:
-    def test_joins_cvedetails_resource_type(self, kql: str) -> None:
+class TestNoCvedetailsJoin:
+    """Prior attempt to JOIN with `microsoft.security/cvedetails` returned
+    zero matches at the client (cvedetails is not populated in this tenant,
+    across all accessible subscriptions). All CVE data lives inside
+    `properties.additionalData.CvesDetails[]` on the assessments side and
+    must be read directly from `cve.*`."""
+
+    def test_kql_has_no_cvedetails_join(self, kql: str) -> None:
+        assert "microsoft.security/cvedetails" not in kql, (
+            "cvedetails is empty in target tenants; JOIN must be removed"
+        )
+
+    def test_kql_has_no_leftouter_join(self, kql: str) -> None:
+        assert not re.search(r"join\s+kind\s*=\s*leftouter", kql, re.IGNORECASE), (
+            "no JOIN needed — everything reads from cve.* directly"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4. CVE-level fields read from `cve.*` inside CvesDetails[]
+# ---------------------------------------------------------------------------
+
+
+class TestCveFieldsInline:
+    """Confirmed by bag_keys probe on the client tenant: every field we need
+    is present under `cve.*` in the mv-expanded CvesDetails[] array."""
+
+    def test_severity_from_cve(self, kql: str) -> None:
+        assert re.search(r"\bcve\.Severity\b", kql), (
+            "severity must come from cve.Severity (inline in CvesDetails[])"
+        )
+
+    def test_cvss_base_from_cve_array(self, kql: str) -> None:
+        # cve.Cvss is an array of {Key, Value: {Base, CvssVectorString}}.
+        # First entry is the operative CVSS score in every sample seen.
+        assert re.search(r"cve\.Cvss\[\s*0\s*\]\.Value\.Base", kql), (
+            "cvss numeric must be read as cve.Cvss[0].Value.Base"
+        )
+
+    def test_fixstatus_from_cve(self, kql: str) -> None:
+        assert re.search(r"\bcve\.FixStatus\b", kql)
+
+    def test_fixed_version_from_cve(self, kql: str) -> None:
+        assert re.search(r"\bcve\.FixedVersion\b", kql)
+
+    def test_published_date_from_cve(self, kql: str) -> None:
+        assert re.search(r"\bcve\.PublishedDate\b", kql)
+
+    def test_description_from_cve(self, kql: str) -> None:
+        assert re.search(r"\bcve\.Description\b", kql)
+
+    def test_exploit_kit_from_cve_exploitability_details(self, kql: str) -> None:
         assert re.search(
-            r"microsoft\.security/cvedetails",
+            r"cve\.ExploitabilityDetails\.IsInExploitKit", kql,
+        )
+
+    def test_published_exploit_signal_from_cve(self, kql: str) -> None:
+        # Defensive: accept either legacy `ExploitStepsPublished` or the
+        # newer `IsPubliclyDisclosed` — both may appear in different tenants.
+        assert re.search(
+            r"cve\.ExploitabilityDetails\.(ExploitStepsPublished|IsPubliclyDisclosed)",
             kql,
-        ), "must join microsoft.security/cvedetails to get severity/CVSS/exploit"
+        ), "hasPublishedExploit must read from cve.ExploitabilityDetails"
 
-    def test_join_is_leftouter(self, kql: str) -> None:
-        # leftouter preserves rows where cvedetails is missing (edge case:
-        # very new CVEs not yet in the catalog).
-        assert re.search(r"join\s+kind\s*=\s*leftouter", kql, re.IGNORECASE)
-
-    def test_join_key_is_cveid(self, kql: str) -> None:
-        # `... ) on cveId` (case-insensitive)
-        assert re.search(r"\)\s*on\s+cveId", kql, re.IGNORECASE)
+    def test_verified_exploit_signal_from_cve(self, kql: str) -> None:
+        assert re.search(
+            r"cve\.ExploitabilityDetails\.(ExploitStepsVerified|IsVerified)",
+            kql,
+        ), "hasVerifiedExploit must read from cve.ExploitabilityDetails"
 
 
 # ---------------------------------------------------------------------------
-# 4. Field-source paths validated against the client's tenant
+# 5. Image identity + package version — validated structured paths
 # ---------------------------------------------------------------------------
 
 
 class TestFieldSources:
     def test_parses_scanners_details(self, kql: str) -> None:
-        # additionalData.ScannersDetails is a JSON string that must be parsed
-        # to reach the mdvm sub-object (where DetectedSoftwareVersions and
-        # FixedVersion live).
         assert re.search(
             r"parse_json\s*\(\s*tostring\s*\(\s*properties\.additionalData\.ScannersDetails",
             kql,
@@ -197,26 +240,18 @@ class TestFieldSources:
         )
 
     def test_current_version_from_scanner_mdvm(self, kql: str) -> None:
-        # Scanner.mdvm.DetectedSoftwareVersions[0] — array, first element.
         assert re.search(
             r"mdvm\.DetectedSoftwareVersions\s*\[\s*0\s*\]",
             kql,
         )
 
-    def test_fixed_version_from_scanner_mdvm(self, kql: str) -> None:
-        assert re.search(r"mdvm\.FixedVersion", kql)
-
     def test_repository_from_repository_details(self, kql: str) -> None:
         assert re.search(r"RepositoryDetails\.RepositoryName", kql)
 
     def test_digest_from_image_data(self, kql: str) -> None:
-        # ImageData is the parsed resourceAdditionalData; .Digest is at the top.
-        # No more URL regex extraction — the structured field is authoritative.
         assert re.search(r"\.Digest\b", kql)
 
     def test_no_url_regex_for_digest(self, kql: str) -> None:
-        # Regression guard against re-introducing the old
-        # `strcat("sha256:", extract(@"sha256:...", 1, resourceId))` hack.
         assert not re.search(r'extract\s*\(\s*@?"sha256:', kql), (
             "digest must come from parsed resourceAdditionalData.Digest, "
             "not regex extraction from the URL"
@@ -224,69 +259,17 @@ class TestFieldSources:
 
 
 # ---------------------------------------------------------------------------
-# 5. CVSS 4.0/3.1/3.0/2.0 support (new in individual model)
-# ---------------------------------------------------------------------------
-
-
-class TestCvssMultiVersion:
-    def test_cvss_40_read(self, kql: str) -> None:
-        assert re.search(r'cvss\s*\[\s*"4\.0"\s*\]\.base', kql)
-
-    def test_cvss_31_read(self, kql: str) -> None:
-        assert re.search(r'cvss\s*\[\s*"3\.1"\s*\]\.base', kql)
-
-    def test_cvss_30_read(self, kql: str) -> None:
-        assert re.search(r'cvss\s*\[\s*"3\.0"\s*\]\.base', kql)
-
-    def test_cvss_20_read(self, kql: str) -> None:
-        assert re.search(r'cvss\s*\[\s*"2\.0"\s*\]\.base', kql)
-
-    def test_cvss_versions_coalesced(self, kql: str) -> None:
-        # All four versions must be inside one coalesce (prefer newest).
-        assert _coalesce_contains_all(kql, '"4.0"', '"3.1"', '"3.0"', '"2.0"')
-
-
-# ---------------------------------------------------------------------------
-# 6. Exploit signals — renamed fields from cvedetails.exploitabilityDetails
-# ---------------------------------------------------------------------------
-
-
-class TestExploitSignalRenames:
-    def test_uses_is_in_exploit_kit(self, kql: str) -> None:
-        assert re.search(r"exploitabilityDetails\.IsInExploitKit", kql)
-
-    def test_uses_is_publicly_disclosed_not_exploit_steps_published(
-        self, kql: str,
-    ) -> None:
-        # NEW: IsPubliclyDisclosed (was ExploitStepsPublished in Leg A)
-        assert re.search(r"exploitabilityDetails\.IsPubliclyDisclosed", kql)
-        # Regression guard against re-adding the old name.
-        assert "ExploitStepsPublished" not in kql, (
-            "field renamed to IsPubliclyDisclosed in the individual model"
-        )
-
-    def test_uses_is_verified_not_exploit_steps_verified(self, kql: str) -> None:
-        # NEW: IsVerified (was ExploitStepsVerified in Leg A)
-        assert re.search(r"exploitabilityDetails\.IsVerified\b", kql)
-        assert "ExploitStepsVerified" not in kql, (
-            "field renamed to IsVerified in the individual model"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 7. Coalesce order for the 3 fields with multiple candidate paths
+# 6. Coalesce order for fields with multiple candidate paths
 # ---------------------------------------------------------------------------
 
 
 class TestFieldCoalesceOrder:
     def test_package_category_coalesce_paths(self, kql: str) -> None:
-        # All 3 candidate paths that came back populated in the probe:
-        #   additionalData.PackageType, Scanner.mdvm.category, Scanner.mdvm.PackageType
         assert _coalesce_contains_all(
             kql, "additionalData.PackageType", "mdvm.category",
         ) or _coalesce_contains_all(
             kql, "additionalData.PackageType", "mdvm.PackageType",
-        ), "packageCategory must coalesce additionalData.PackageType with an mdvm.* fallback"
+        )
 
     def test_package_language_coalesce_paths(self, kql: str) -> None:
         assert _coalesce_contains_all(
@@ -294,34 +277,32 @@ class TestFieldCoalesceOrder:
         )
 
     def test_fix_status_coalesce_paths(self, kql: str) -> None:
-        # At least two of the 3 candidate paths must be in one coalesce.
+        # Multiple candidates; require at least cve.FixStatus AND one alternate.
         assert (
-            _coalesce_contains_all(kql, "additionalData.FixStatus", "mdvm.FixStatus")
-            or _coalesce_contains_all(kql, "additionalData.FixStatus", "Cve.FixStatus")
-            or _coalesce_contains_all(kql, "Cve.FixStatus", "mdvm.FixStatus")
+            _coalesce_contains_all(kql, "cve.FixStatus", "mdvm.FixStatus")
+            or _coalesce_contains_all(kql, "cve.FixStatus", "additionalData.FixStatus")
         )
 
-    def test_last_pushed_coalesce_paths(self, kql: str) -> None:
-        # Top-level LastPushedToRegistryUTC OR nested under RepositoryDetails.
-        assert _coalesce_contains_all(
-            kql,
-            "LastPushedToRegistryUTC",
-            "RepositoryDetails.LastPushedToRegistryUTC",
-        ) or (
-            "LastPushedToRegistryUTC" in kql
+    def test_cvss_falls_back_to_severity_case(self, kql: str) -> None:
+        """When cve.Cvss[0].Value.Base is missing, cvssScore must fall back
+        to a case-on-severity mapping so `Unknown` rows deterministically
+        land at 0.0 (and are filtered out by min-score) instead of null."""
+        # Presence-based check (paren-aware regex would be brittle):
+        # we need `case(...)`, a Severity reference, and the Critical→9.0
+        # mapping literally somewhere in the KQL.
+        assert "case(" in kql
+        assert re.search(r"\b[Ss]everity\b", kql)
+        assert '"Critical", 9.0' in kql, (
+            "cvssScore fallback must map Critical severity to 9.0"
         )
 
 
 # ---------------------------------------------------------------------------
-# 8. Downstream contracts — CSV column order + single leg
+# 7. Downstream contracts — CSV column order + single leg
 # ---------------------------------------------------------------------------
 
 
 class TestCsvColumnOrderPreserved:
-    """CSV column order is a downstream contract — `expandcsv.py`,
-    `group_findings.py` and `report.py` all key off the KQL `| project`
-    column list. Post-migration must preserve the exact same list."""
-
     EXPECTED_PROJECT_COLUMNS: ClassVar[list[str]] = [
         "repository", "digest", "cvssScore", "cveId", "severityRaw",
         "packageCategory", "packageLanguage", "packageName",
@@ -331,12 +312,6 @@ class TestCsvColumnOrderPreserved:
     ]
 
     def test_project_column_list_matches(self, kql: str) -> None:
-        # Only count top-level projects — the cvedetails JOIN subquery
-        # also has a `| project`, which is scoped and doesn't count.
-        # Heuristic: any `| project` that appears OUTSIDE a `join kind=leftouter (...)`
-        # block. Simpler: split on `join kind=leftouter (` and count in the
-        # part AFTER the closing `)` — the final projection.
-        # For a query with one JOIN, the last `| project` is the top-level one.
         projects = re.findall(r"\|\s*project\s+([^\n|]+)", kql)
         assert projects, "no `| project` clause found"
         top_level = [
@@ -357,7 +332,4 @@ class TestCsvColumnOrderPreserved:
 
 class TestSingleLegNotUnion:
     def test_kql_has_no_union(self, kql: str) -> None:
-        # Post-migration: single leg + one JOIN, never a union.
-        assert not re.search(r"\|\s*union\s*\(", kql), (
-            "post-migration KQL should be a single leg + JOIN, not `| union`"
-        )
+        assert not re.search(r"\|\s*union\s*\(", kql)
