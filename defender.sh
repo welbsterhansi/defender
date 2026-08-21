@@ -829,20 +829,28 @@ elif [ -n "$REPOSITORIES" ]; then
     EARLY_FILTER_B="| where $_expr_b"
 fi
 
-# MDVM individual-recommendations model (post-2026-07-31 migration).
+# MDVM individual-recommendations model (post-2026-07-31 migration, take 2).
 #
-# Microsoft retired the legacy grouped `subassessments` type on 2026-07-31 —
-# the old "Leg A" (subassessments + c0b7cfc6-… assessment key) returns zero
-# rows now. This single leg queries the individual-recommendations model
-# Microsoft documents as the replacement for ACR containers.
-# See docs/investigation-mdvm-2026-08.md and the MS transition reference:
-# https://learn.microsoft.com/en-us/azure/defender-for-cloud/transition-grouped-individual-recommendations
+# Microsoft retired the legacy `subassessments` type on 2026-07-31. The
+# initial migration attempt (single leg on `assessments`) came back with
+# most fields empty because Microsoft split CVE-level data across TWO
+# resource types in the individual model:
 #
-# Casing note: Microsoft emits some `additionalData` fields as PascalCase
-# and some as camelCase across rows in the individual model. Every read of
-# a field that varies is wrapped in `coalesce(PascalCase, camelCase)` —
-# pattern validated in the community SQL VA migration
-# (Azure/Microsoft-Defender-for-Cloud PR#1047, merged 2026-07-02).
+#   microsoft.security/assessments  → carries the per-image finding, with
+#                                     CvesDetails[] reduced to essentially
+#                                     just {CveId}, plus package data in
+#                                     additionalData.ScannersDetails.mdvm.*
+#                                     and image identity in
+#                                     resourceAdditionalData.RepositoryDetails.*
+#   microsoft.security/cvedetails   → carries severity, cvss[<version>].base,
+#                                     publishedDate, exploitabilityDetails.*,
+#                                     description, remediation. Joined on CveId.
+#
+# Schema paths were empirically validated against the client's tenant with
+# a probe query (see docs/investigation-mdvm-2026-08.md). Notable renames
+# in exploitabilityDetails: `IsPubliclyDisclosed` (was `ExploitStepsPublished`)
+# and `IsVerified` (was `ExploitStepsVerified`). CVSS now supports 4.0/3.1/
+# 3.0/2.0 with string keys (e.g. `cvss["4.0"].base`).
 cat > "$QUERY_FILE" << ENDQUERY
 securityresources
 | where type == "microsoft.security/assessments"
@@ -850,107 +858,87 @@ securityresources
 | where properties.resourceDetails.ResourceType == ".containerimage"
 | where properties.resourceDetails.Source == "Azure"
 $EARLY_FILTER_B
-| extend _resourceId = tolower(coalesce(
-    tostring(properties.resourceDetails.Id),
-    tostring(properties.resourceDetails.id),
-    extract("(.+)/providers/Microsoft.Security", 1, tostring(id))
-  ))
-| where isnotempty(_resourceId)
 | extend
-    _rad = parse_json(tostring(properties.resourceAdditionalData)),
-    _dashedPath = extract(@"repositories-(.+)-images-sha256:[a-f0-9]+", 1, _resourceId),
-    _resourceName = tostring(properties.resourceDetails.ResourceName),
-    _digest = strcat("sha256:", extract(@"sha256:([a-f0-9]+)", 1, _resourceId)),
-    _cvesJson = parse_json(tostring(coalesce(
-        properties.additionalData.CvesDetails,
-        properties.additionalData.cvesDetails
-    ))),
-    _pkgCategory = tostring(coalesce(
+    _scanner = parse_json(tostring(properties.additionalData.ScannersDetails)),
+    _image   = parse_json(tostring(properties.resourceAdditionalData)),
+    _cves    = parse_json(tostring(properties.additionalData.CvesDetails))
+| mv-expand cve = _cves
+| extend cveId = tostring(cve.CveId)
+| where isnotempty(cveId)
+| join kind=leftouter (
+    securityresources
+    | where type =~ "microsoft.security/cvedetails"
+    | extend _cvss = coalesce(
+        todouble(properties.cvss["4.0"].base),
+        todouble(properties.cvss["3.1"].base),
+        todouble(properties.cvss["3.0"].base),
+        todouble(properties.cvss["2.0"].base)
+      )
+    | project
+        cveId                = tostring(properties.cveId),
+        _joinSeverity        = tostring(properties.severity),
+        _joinCvss            = _cvss,
+        _joinPublished       = todatetime(properties.publishedDate),
+        _joinExploitKit      = tobool(properties.exploitabilityDetails.IsInExploitKit),
+        _joinExploitVerified = tobool(properties.exploitabilityDetails.IsVerified),
+        _joinExploitPublic   = tobool(properties.exploitabilityDetails.IsPubliclyDisclosed),
+        _joinDescription     = tostring(properties.description),
+        _joinRemediation     = tostring(properties.remediation)
+  ) on cveId
+| extend
+    repository = tostring(_image.RepositoryDetails.RepositoryName),
+    digest     = tostring(_image.Digest),
+    lastPushedToRegistryUTC = tostring(coalesce(
+        _image.LastPushedToRegistryUTC,
+        _image.RepositoryDetails.LastPushedToRegistryUTC
+    )),
+    packageName = tostring(properties.additionalData.SoftwareName),
+    currentVersion = tostring(_scanner.mdvm.DetectedSoftwareVersions[0]),
+    fixedVersion   = tostring(_scanner.mdvm.FixedVersion),
+    packageCategory = tostring(coalesce(
         properties.additionalData.PackageType,
-        properties.additionalData.packageType
+        _scanner.mdvm.category,
+        _scanner.mdvm.PackageType
     )),
-    _pkgLanguage = tostring(coalesce(
+    packageLanguage = tostring(coalesce(
         properties.additionalData.Language,
-        properties.additionalData.language
+        _scanner.mdvm.Language
     )),
-    _pkgName = tostring(coalesce(
-        properties.additionalData.SoftwareName,
-        properties.additionalData.softwareName
+    fixStatus = tostring(coalesce(
+        properties.additionalData.FixStatus,
+        cve.FixStatus,
+        _scanner.mdvm.FixStatus
     )),
-    _detectedVersion = tostring(coalesce(
-        properties.additionalData.DetectedSoftwareVersions,
-        properties.additionalData.detectedSoftwareVersions
+    remediation = tostring(coalesce(
+        _joinRemediation,
+        _joinDescription,
+        cve.Description
     )),
-    _topSeverity = tostring(coalesce(
-        properties.metadata.severity,
-        properties.status.severity
-    ))
-| mv-expand cve = _cvesJson
-| extend
-    cveId = tostring(coalesce(cve.CveId, cve.cveId)),
-    _cveSeverity = tostring(coalesce(cve.Severity, cve.severity)),
-    _cveFixStatus = tostring(coalesce(cve.FixStatus, cve.fixStatus)),
-    _cvePublished = coalesce(cve.PublishedDate, cve.publishedDate)
-| extend
+    severityRaw = _joinSeverity,
     cvssScore = coalesce(
-        todouble(coalesce(cve.Cvss[0].Value.Base, cve.cvss[0].value.base)),
+        _joinCvss,
         case(
-            _cveSeverity =~ "Critical", 9.0,
-            _cveSeverity =~ "High",     7.0,
-            _cveSeverity =~ "Medium",   4.0,
-            _cveSeverity =~ "Low",      0.1,
+            _joinSeverity =~ "Critical", 9.0,
+            _joinSeverity =~ "High",     7.0,
+            _joinSeverity =~ "Medium",   4.0,
+            _joinSeverity =~ "Low",      0.1,
             0.0
         )
     ),
-    repository = iff(
-        _dashedPath == _resourceName,
-        _resourceName,
-        strcat(substring(_dashedPath, 0, strlen(_dashedPath) - strlen(_resourceName) - 1), "/", _resourceName)
-    ),
-    digest = _digest,
-    severityRaw = coalesce(_cveSeverity, _topSeverity),
-    packageCategory = _pkgCategory,
-    packageLanguage = _pkgLanguage,
-    packageName = _pkgName,
-    currentVersion = _detectedVersion,
-    fixedVersion = tostring(coalesce(cve.FixedVersion, cve.fixedVersion)),
-    patchable = case(
-        _cveFixStatus =~ "FixAvailable", "true",
-        _cveFixStatus in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
-        ""
-    ),
-    remediation = tostring(coalesce(cve.Description, cve.description)),
-    fixStatus = _cveFixStatus,
     cveAgeDays = iff(
-        isnotnull(_cvePublished),
-        datetime_diff('day', now(), todatetime(_cvePublished)),
+        isnotnull(_joinPublished),
+        datetime_diff('day', now(), _joinPublished),
         long(-1)
     ),
-    isInExploitKit = iff(
-        isnotnull(coalesce(cve.ExploitabilityDetails.IsInExploitKit,
-                           cve.exploitabilityDetails.isInExploitKit))
-            and tobool(coalesce(cve.ExploitabilityDetails.IsInExploitKit,
-                                cve.exploitabilityDetails.isInExploitKit)),
-        "true", "false"
-    ),
-    hasPublishedExploit = iff(
-        isnotnull(coalesce(cve.ExploitabilityDetails.ExploitStepsPublished,
-                           cve.exploitabilityDetails.exploitStepsPublished))
-            and tobool(coalesce(cve.ExploitabilityDetails.ExploitStepsPublished,
-                                cve.exploitabilityDetails.exploitStepsPublished)),
-        "true", "false"
-    ),
-    hasVerifiedExploit = iff(
-        isnotnull(coalesce(cve.ExploitabilityDetails.ExploitStepsVerified,
-                           cve.exploitabilityDetails.exploitStepsVerified))
-            and tobool(coalesce(cve.ExploitabilityDetails.ExploitStepsVerified,
-                                cve.exploitabilityDetails.exploitStepsVerified)),
-        "true", "false"
-    ),
-    lastPushedToRegistryUTC = tostring(coalesce(
-        _rad.LastPushedToRegistryUTC,
-        _rad.lastPushedToRegistryUTC
-    ))
+    isInExploitKit      = iff(_joinExploitKit      == true, "true", "false"),
+    hasPublishedExploit = iff(_joinExploitPublic   == true, "true", "false"),
+    hasVerifiedExploit  = iff(_joinExploitVerified == true, "true", "false")
+| extend patchable = case(
+    fixStatus =~ "FixAvailable", "true",
+    fixStatus in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
+    isnotempty(fixedVersion), "true",
+    ""
+  )
 | where cveId startswith "CVE-" and cvssScore >= $MIN_SCORE and cvssScore <= $MAX_SCORE
 | project repository, digest, cvssScore, cveId, severityRaw, packageCategory, packageLanguage, packageName, currentVersion, fixedVersion, patchable, remediation, fixStatus, cveAgeDays, isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC
 ENDQUERY
