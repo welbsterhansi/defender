@@ -1,29 +1,31 @@
 """
-TDD invariants for the MDVM individual-recommendations migration.
+TDD invariants for the MDVM individual-recommendations migration
++ 2026-08 cvedetails enrichment fix.
 
 Microsoft retired the legacy `microsoft.security/assessments/subassessments`
-type on 2026-07-31 (see docs/investigation-mdvm-2026-08.md). The individual
-model for ACR containers stores CVE-level data INLINE inside
-`properties.additionalData.CvesDetails[]` — the same structure the
-pre-migration Leg B already used. There is NO cross-resource JOIN needed
-in this tenant (an earlier attempt to JOIN with `microsoft.security/cvedetails`
-returned zero matches because that resource type is not populated here).
+type on 2026-07-31. In the current model:
 
-Empirically validated `cve.*` bag keys (from a probe run at the client):
+  * Image + package + per-CVE linkage lives in
+    `microsoft.security/assessments` (individual-recommendations), inside
+    `properties.additionalData.CvesDetails[]` (mv-expanded to one row per CVE).
+  * CVE metadata (CVSS score, severity, exploitability, publishedDate) is
+    now published at management-group scope in
+    `microsoft.security/cvedetails`. See
+    `docs/mdvm-cvedetails-schema-2026-08.md` for the full sample.
 
-    ["CveId", "AdditionalIdentifiers", "Description", "ExtendedDescription",
-     "Cvss", "CvssSource", "Severity", "PublishedDate", "LastModifiedDate",
-     "Weaknesses", "FixStatus", "FixedVersion", "ExploitabilityDetails",
-     "References", "Tags"]
+The KQL performs a LEFT OUTER JOIN between the two so:
+  * Rows are NEVER lost when cvedetails is unreachable (fallback to inline).
+  * When cvedetails IS reachable, it overrides the (empty/stale) inline data.
 
-CVSS is an array of Key/Value objects, e.g.
-    [{"Key": "3", "Value": {"Base": 7.1, "CvssVectorString": "..."}}]
-so numeric extraction is `todouble(cve.Cvss[0].Value.Base)`.
+Client-tenant traps encoded here as guardrail invariants:
 
-Image identity comes from `properties.resourceAdditionalData.RepositoryDetails.*`
-(clean structured fields — no URL regex extraction).
-
-Package version comes from `properties.additionalData.ScannersDetails.mdvm.*`.
+  * `properties.cvss` is a DICT keyed by string version. Keys are exactly
+    `"4.0"`, `"3.0"`, `"2.0"` — there is NO `"3.1"` key. A coalesce that
+    references `'3.1'` silently drops every CVSS 3.x-only CVE.
+  * Version buckets have lowercase `base` (`.cvss["3.0"].base`), not the
+    old inline `.Cvss[0].Value.Base` PascalCase shape.
+  * Rejected CVEs (`properties.status == "Reject"`) have all cvss buckets
+    null and must be filtered out of the enrichment side.
 
 These tests inspect the KQL heredoc embedded in `defender.sh` (they do NOT
 run `az`) and enforce the invariants so any regression is caught in CI.
@@ -140,25 +142,111 @@ class TestIndividualModelEntryPoint:
 
 
 # ---------------------------------------------------------------------------
-# 3. No JOIN with cvedetails — the resource type is empty in target tenants
+# 3. cvedetails JOIN present with the correct schema
 # ---------------------------------------------------------------------------
 
 
-class TestNoCvedetailsJoin:
-    """Prior attempt to JOIN with `microsoft.security/cvedetails` returned
-    zero matches at the client (cvedetails is not populated in this tenant,
-    across all accessible subscriptions). All CVE data lives inside
-    `properties.additionalData.CvesDetails[]` on the assessments side and
-    must be read directly from `cve.*`."""
+class TestCvedetailsJoinPresent:
+    """CVE enrichment (cvss / severity / exploitability / publishedDate)
+    now lives in `microsoft.security/cvedetails` (management-group scope).
+    The KQL must LEFT OUTER JOIN with it so those fields are populated
+    when the caller's `az login` context reaches the MG, and gracefully
+    degrade (via inline fallback) when it doesn't."""
 
-    def test_kql_has_no_cvedetails_join(self, kql: str) -> None:
-        assert "microsoft.security/cvedetails" not in kql, (
-            "cvedetails is empty in target tenants; JOIN must be removed"
+    def test_kql_references_cvedetails_type(self, kql: str) -> None:
+        assert "microsoft.security/cvedetails" in kql, (
+            "enrichment side must query microsoft.security/cvedetails"
         )
 
-    def test_kql_has_no_leftouter_join(self, kql: str) -> None:
-        assert not re.search(r"join\s+kind\s*=\s*leftouter", kql, re.IGNORECASE), (
-            "no JOIN needed — everything reads from cve.* directly"
+    def test_kql_uses_leftouter_join(self, kql: str) -> None:
+        assert re.search(r"join\s+kind\s*=\s*leftouter", kql, re.IGNORECASE), (
+            "must LEFT OUTER JOIN so rows are not lost when cvedetails is "
+            "unreachable (e.g. az login not scoped to the MG)"
+        )
+
+    def test_join_key_is_normalized_cveid(self, kql: str) -> None:
+        # CVE ids differ in casing between assessments (uppercase, CVE-XXXX)
+        # and cvedetails.name (lowercase, cve-xxxx). Join must upper() both
+        # sides to avoid silently missing every enrichment match.
+        assert re.search(r"toupper\s*\(\s*tostring\s*\(\s*properties\.cveId",
+                         kql), (
+            "cvedetails-side join key must upper() properties.cveId"
+        )
+        assert re.search(r"toupper\s*\(\s*cveId\s*\)", kql), (
+            "assessments-side join key must upper() cveId"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3b. cvedetails schema guardrails (the "3.1" bug and friends)
+# ---------------------------------------------------------------------------
+
+
+class TestCvedetailsSchemaGuardrails:
+    """Regression guards against the exact bugs the client debug surfaced
+    in 2026-08. Each of these silently returns null / unknown / 0.0 if
+    violated — no runtime error, just bad data in the CSV."""
+
+    def test_no_cvss_31_key(self, kql: str) -> None:
+        # properties.cvss has "4.0", "3.0", "2.0" — NEVER "3.1".
+        # Match the literal key form (quoted "3.1") but tolerate the
+        # CVSS 3.1 vector string that appears under the "3.0" bucket.
+        for pattern in (r'cvss\[\s*"3\.1"\s*\]', r"cvss\[\s*'3\.1'\s*\]",
+                        r'\bcvss\.\s*"3\.1"', r"properties\.cvss\.\['3\.1'\]"):
+            assert not re.search(pattern, kql), (
+                f"forbidden CVSS key '3.1' matched pattern {pattern!r} — "
+                "the enrichment schema has NO 3.1 key"
+            )
+
+    def test_cvss_coalesce_uses_correct_keys(self, kql: str) -> None:
+        # The coalesce must reference all three real keys.
+        for key in ('"4.0"', '"3.0"', '"2.0"'):
+            assert re.search(
+                rf"cvss\[\s*{re.escape(key)}\s*\]\.base", kql,
+            ), f"cvss key {key} missing from enrichment coalesce"
+
+    def test_cvss_coalesce_orders_4_before_3_before_2(self, kql: str) -> None:
+        # 4.0 must win when present (newest scoring model), then 3.0, then 2.0.
+        i40 = kql.find('cvss["4.0"].base')
+        i30 = kql.find('cvss["3.0"].base')
+        i20 = kql.find('cvss["2.0"].base')
+        assert i40 != -1 and i30 != -1 and i20 != -1, (
+            "all three cvss key reads must be present"
+        )
+        assert i40 < i30 < i20, (
+            "cvss coalesce must be 4.0 → 3.0 → 2.0 (found "
+            f"positions 4.0={i40} 3.0={i30} 2.0={i20})"
+        )
+
+    def test_rejected_cves_filtered_out(self, kql: str) -> None:
+        # cvedetails rows with status="Reject" have all cvss null and
+        # should not participate in the enrichment side. Accept an
+        # optional tostring(...) wrapper around properties.status.
+        assert re.search(
+            r"properties\.status[^!\n]*\)?\s*!~\s*['\"]Reject['\"]", kql,
+        ), "enrichment side must filter out status='Reject' CVEs"
+
+    def test_severity_read_from_cvedetails_properties(self, kql: str) -> None:
+        assert re.search(r"\bproperties\.severity\b", kql), (
+            "severity must be read from cvedetails.properties.severity"
+        )
+
+    def test_exploit_flags_read_from_cvedetails_properties(
+        self, kql: str,
+    ) -> None:
+        # camelCase container, PascalCase leaves — exactly as the client
+        # sample shows. If Microsoft ever ships PascalCase container
+        # (`ExploitabilityDetails`) we'll notice via this test.
+        for leaf in ("IsInExploitKit", "IsPubliclyDisclosed", "IsVerified"):
+            assert re.search(
+                rf"properties\.exploitabilityDetails\.{leaf}\b", kql,
+            ), f"missing enrichment read: properties.exploitabilityDetails.{leaf}"
+
+    def test_published_date_read_from_cvedetails_properties(
+        self, kql: str,
+    ) -> None:
+        assert re.search(r"\bproperties\.publishedDate\b", kql), (
+            "cveAgeDays must be derived from cvedetails.properties.publishedDate"
         )
 
 

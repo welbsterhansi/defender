@@ -829,43 +829,60 @@ elif [ -n "$REPOSITORIES" ]; then
     EARLY_FILTER_B="| where $_expr_b"
 fi
 
-# MDVM individual-recommendations model (post-2026-07-31 migration, take 3).
+# MDVM individual-recommendations + cvedetails enrichment (2026-08 fix).
 #
-# Microsoft retired the legacy `subassessments` type on 2026-07-31. Take 2
-# assumed CVE-level data had moved to `microsoft.security/cvedetails` (based
-# on a portal query pattern that appeared to work). Client-tenant validation
-# proved that resource type is EMPTY there (0 rows across all subscriptions,
-# no alternate resource type with cve/vuln in the name). So the JOIN pattern
-# is wrong for real tenants.
+# Microsoft retired the legacy `subassessments` type on 2026-07-31. The
+# post-migration path was: read image + package + CVE-list from
+# `microsoft.security/assessments` and CVE metadata (CVSS, severity,
+# exploitability, publishedDate) INLINE from `properties.additionalData.
+# CvesDetails[]`. In target tenants that inline path returns Cvss=[]
+# and Severity="" — so cvssScore lands at 0.0 and every CVE writes
+# "unknown" in the CSV.
 #
-# Truth on the ground: every CVE field lives INLINE inside `properties.
-# additionalData.CvesDetails[]` — the same structure Leg B used pre-2026-07-31.
-# Empirically confirmed keys inside each cve element (via bag_keys probe):
+# The correct enrichment source is now `microsoft.security/cvedetails`
+# (published at management-group scope). Schema — see
+# `docs/mdvm-cvedetails-schema-2026-08.md` for the full sample.
 #
-#     CveId, AdditionalIdentifiers, Description, ExtendedDescription,
-#     Cvss (array of {Key, Value: {Base, CvssVectorString}}), CvssSource,
-#     Severity, PublishedDate, LastModifiedDate, Weaknesses, FixStatus,
-#     FixedVersion, ExploitabilityDetails, References, Tags
+# Key gotchas from the client debug:
+#   * `properties.cvss` is a DICT keyed by version STRING. Keys are
+#     exactly "4.0", "3.0", "2.0" — there is NO "3.1" key. A coalesce
+#     that includes '3.1' silently drops every CVSS 3.x-only CVE.
+#   * Each version bucket is `{ "base": <num>, "cvssVectorString": … }`
+#     with lowercase `base` (not `.Value.Base` as in the old inline shape).
+#   * Rejected CVEs have `status="Reject"` and all cvss buckets null —
+#     filter them out or they inflate row counts with score 0.0.
+#   * `IsPubliclyDisclosed` / `IsInExploitKit` / `IsVerified` live under
+#     `properties.exploitabilityDetails` (camelCase container, PascalCase
+#     leaf keys).
 #
-# So this query reads everything from `cve.*` directly, with NO JOIN.
-# Structural changes vs pre-migration Leg B:
-#   * Entry point is the individual-model 4 where-clauses (unchanged for
-#     the last 2 iterations — validated returning 56k+ container rows).
-#   * Image identity from `resourceAdditionalData.RepositoryDetails.*` +
-#     `.Digest` (structured — no URL regex).
-#   * Package version from `additionalData.ScannersDetails.mdvm.*`.
-#   * Package category/language/fixStatus coalesce across the 3 candidate
-#     paths surfaced by the probe.
-#   * Exploit signals `hasPublishedExploit`/`hasVerifiedExploit` use
-#     coalesce over both legacy names (`ExploitStepsPublished/Verified`)
-#     and newer names (`IsPubliclyDisclosed/IsVerified`) since either may
-#     appear depending on the tenant's Defender data-pipeline version.
+# Still read from `assessments` (per-package linkage doesn't exist in
+# cvedetails): `repository`, `digest`, `packageName`, `currentVersion`,
+# `packageCategory`, `packageLanguage`, `remediation`, `cveId`,
+# `fixedVersion`, `fixStatus`.
 #
-# CVSS: `cve.Cvss` is an array like `[{"Key":"3","Value":{"Base":7.1,...}}]`
-# — first entry is the operative score in every sample. Fallback to
-# case-on-severity keeps Unknown-severity rows from silently disappearing
-# with null cvssScore (they land at 0.0 and are filtered by min-score).
+# LEFT OUTER JOIN so rows aren't lost when cvedetails is unreachable
+# (e.g. `az login` scoped to a subscription that can't see the MG
+# enrichment). In that case enrichment fields fall back to the inline
+# values, preserving the previous behaviour instead of dropping rows.
 cat > "$QUERY_FILE" << ENDQUERY
+let cvedetails =
+    securityresources
+    | where type == "microsoft.security/cvedetails"
+    | where tostring(properties.status) !~ "Reject"
+    | extend cveIdJoin = toupper(tostring(properties.cveId))
+    | extend
+        _cvssEnrich = todouble(coalesce(
+            properties.cvss["4.0"].base,
+            properties.cvss["3.0"].base,
+            properties.cvss["2.0"].base
+        )),
+        _severityEnrich       = tostring(properties.severity),
+        _publishedDateEnrich  = todatetime(properties.publishedDate),
+        _inExploitKitEnrich   = tobool(properties.exploitabilityDetails.IsInExploitKit),
+        _publishedExpEnrich   = tobool(properties.exploitabilityDetails.IsPubliclyDisclosed),
+        _verifiedExpEnrich    = tobool(properties.exploitabilityDetails.IsVerified)
+    | project cveIdJoin, _cvssEnrich, _severityEnrich, _publishedDateEnrich,
+              _inExploitKitEnrich, _publishedExpEnrich, _verifiedExpEnrich;
 securityresources
 | where type == "microsoft.security/assessments"
 | where properties.metadata.recommendationCategory == "SoftwareUpdate"
@@ -879,6 +896,8 @@ $EARLY_FILTER_B
 | mv-expand cve = _cves
 | extend cveId = tostring(cve.CveId)
 | where isnotempty(cveId)
+| extend cveIdJoin = toupper(cveId)
+| join kind=leftouter cvedetails on cveIdJoin
 | extend
     repository = tostring(_image.RepositoryDetails.RepositoryName),
     digest     = tostring(_image.Digest),
@@ -908,28 +927,33 @@ $EARLY_FILTER_B
         properties.remediation,
         properties.description
     )),
-    severityRaw = tostring(cve.Severity),
+    severityRaw = tostring(coalesce(_severityEnrich, cve.Severity)),
     cvssScore = coalesce(
+        _cvssEnrich,
         todouble(cve.Cvss[0].Value.Base),
         case(
-            tostring(cve.Severity) =~ "Critical", 9.0,
-            tostring(cve.Severity) =~ "High",     7.0,
-            tostring(cve.Severity) =~ "Medium",   4.0,
-            tostring(cve.Severity) =~ "Low",      0.1,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Critical", 9.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "High",     7.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Medium",   4.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Low",      0.1,
             0.0
         )
     ),
     cveAgeDays = iff(
-        isnotnull(cve.PublishedDate),
-        datetime_diff('day', now(), todatetime(cve.PublishedDate)),
+        isnotnull(coalesce(_publishedDateEnrich, todatetime(cve.PublishedDate))),
+        datetime_diff('day', now(), coalesce(_publishedDateEnrich, todatetime(cve.PublishedDate))),
         long(-1)
     ),
     isInExploitKit = iff(
-        tobool(cve.ExploitabilityDetails.IsInExploitKit) == true,
+        tobool(coalesce(
+            _inExploitKitEnrich,
+            cve.ExploitabilityDetails.IsInExploitKit
+        )) == true,
         "true", "false"
     ),
     hasPublishedExploit = iff(
         tobool(coalesce(
+            _publishedExpEnrich,
             cve.ExploitabilityDetails.ExploitStepsPublished,
             cve.ExploitabilityDetails.IsPubliclyDisclosed
         )) == true,
@@ -937,6 +961,7 @@ $EARLY_FILTER_B
     ),
     hasVerifiedExploit = iff(
         tobool(coalesce(
+            _verifiedExpEnrich,
             cve.ExploitabilityDetails.ExploitStepsVerified,
             cve.ExploitabilityDetails.IsVerified
         )) == true,
