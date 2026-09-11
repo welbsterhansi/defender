@@ -32,12 +32,10 @@ fi
 
 API="https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01"
 
-TENANT_ID=$(az account show --query tenantId -o tsv 2>/dev/null)
-if [[ -z "$TENANT_ID" ]]; then
+if ! az account show >/dev/null 2>&1; then
     echo "erro: nao logado no az cli. rode 'az login' primeiro." >&2
     exit 1
 fi
-echo "tenant: $TENANT_ID"
 echo "digest: $DIGEST"
 echo ""
 
@@ -135,18 +133,19 @@ securityresources
 KQL_END
 )
 
-# ---------- monta o body: tenant scope + query ----------
+# ---------- monta o body: default scope (todas subs acessiveis) ----------
+# NAO usar managementGroups: [tenant_id] — isso ESCONDE cvedetails.
+# Empirico: com esse filtro, cvedetails count = 0; sem ele = 390k+.
+# Search-AzGraph -UseTenantScope no PowerShell nao mapeia pra managementGroups.
 
 BODY=$(jq -nc \
     --arg q "$KQL" \
-    --arg mg "$TENANT_ID" \
     '{
-        managementGroups: [$mg],
         query: $q,
         options: {"$top": 1000}
     }')
 
-echo "=== chamando ARG (az rest, api 2022-10-01, tenant scope) ==="
+echo "=== chamando ARG (az rest, api 2022-10-01, default scope) ==="
 if ! RESP=$(az rest --method post --url "$API" --body "$BODY" 2>&1); then
     echo "FALHA:" >&2
     echo "$RESP" >&2
