@@ -1445,6 +1445,12 @@ if [ "$TOTAL_DIGESTS" -eq 0 ]; then
         mv -f "$REPORT_TMP" "$REPORT_FILE"
         REPORT_TMP=""
     fi
+    echo "--------------------------------------------------"
+    echo "Processing complete."
+    echo "Total rows found: 0 across 0 digest(s), 0 page(s)"
+    if [ -n "${REPORT_FILE:-}" ] && [ "$BLOCK_IMAGES" = false ] && [ "$UNBLOCK" = false ]; then
+        echo "Report saved to: $REPORT_FILE"
+    fi
     log_info "end total_processed=0 digests=0 report_file=${REPORT_FILE:-<none>}"
     exit 0
 fi

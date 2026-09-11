@@ -62,9 +62,13 @@ if [ "$1 $2 $3" = "acr manifest list-metadata" ]; then
     exit 0
 fi
 
-# `az graph query ...` — capture the -q value (query string, not a path).
-# defender.sh invokes `az graph query -q "$(cat "$QUERY_FILE")"` so `-q`
-# receives the KQL text directly.
+# `az account show` — auth sanity check
+if [ "$1 $2" = "account show" ]; then
+    echo '{{"user":{{"name":"t@t"}},"tenantId":"tid"}}'
+    exit 0
+fi
+
+# `az graph query ...` (legacy) — capture the -q value (query string).
 if [ "$1 $2" = "graph query" ]; then
     qval=""
     while [ $# -gt 0 ]; do
@@ -77,6 +81,21 @@ if [ "$1 $2" = "graph query" ]; then
         printf '%s\\n' "$qval" >> "$CAPTURE_TO"
     fi
     echo '{{"data":[],"skip_token":""}}'
+    exit 0
+fi
+
+# `az rest --method post --url .../resource-graph/... --body '{{"query":"..."}}'`
+# (P2 refactor). Capture the query out of the body via jq.
+if [ "$1" = "rest" ]; then
+    body=""
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--body" ]; then body="$2"; break; fi
+        shift
+    done
+    if [ -n "${{body:-}}" ] && [ -n "${{CAPTURE_TO:-}}" ]; then
+        printf '%s' "$body" | jq -r '.query // ""' >> "$CAPTURE_TO"
+    fi
+    echo '{{"data":[]}}'
     exit 0
 fi
 exit 0
@@ -249,6 +268,9 @@ class TestKqlFilterInjection:
         bin_dir.mkdir(parents=True, exist_ok=True)
         az_body = """#!/usr/bin/env bash
 export CAPTURE_TO="%s"
+if [ "$1 $2" = "account show" ]; then
+    echo '{"user":{"name":"t"},"tenantId":"tid"}'; exit 0
+fi
 if [ "$1 $2" = "acr show" ]; then exit 0; fi
 if [ "$1 $2 $3" = "acr repository list" ]; then
     printf 'team/app\\napp-backend\\n'
@@ -264,6 +286,16 @@ if [ "$1 $2" = "graph query" ]; then
     done
     [ -n "$qval" ] && printf '%%s\\n' "$qval" >> "$CAPTURE_TO"
     echo '{"data":[],"skip_token":""}'
+    exit 0
+fi
+if [ "$1" = "rest" ]; then
+    body=""
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--body" ]; then body="$2"; break; fi
+        shift
+    done
+    [ -n "$body" ] && printf '%%s' "$body" | jq -r '.query // ""' >> "$CAPTURE_TO"
+    echo '{"data":[]}'
     exit 0
 fi
 exit 0
