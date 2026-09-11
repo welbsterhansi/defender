@@ -214,54 +214,243 @@ build_repos_id_anchor_expr() {
 }
 
 # ---------------------------------------------------------------------------
-# Wrap `az graph query` with retry+backoff and JSON validation. On success
-# populates two globals (LAST_QUERY_RESPONSE, LAST_QUERY_RETRIES) so the
-# caller can invoke the function directly without command substitution —
-# `$(...)` would spawn a subshell and swallow those side effects.
+# ---------------------------------------------------------------------------
+# Azure Resource Graph query — REST transport (az rest, api 2022-10-01).
+#
+# Why not `az graph query`? The `resource-graph` CLI extension (2.1.1 as of
+# 2026-09) is pinned to api-version 2021-03-01 with no flag to override. On
+# that version, JOINs against `microsoft.security/cvedetails` silently return
+# enriched=0 rows — so CVSS, exploit signals and publishedDate come back null
+# even though the underlying table has 390k+ populated records. See erros.md.
+#
+# Why NOT pass `managementGroups: [<tenant_id>]` in the body? Empirical:
+# with that filter, cvedetails count drops to 0 (the table disappears from
+# the scope). Default scope (all accessible subscriptions) is what
+# `Search-AzGraph -UseTenantScope` actually uses. See erros.md Erro 5.
+#
+# Populates globals so callers can use side-effect-only invocation
+# (command substitution `$(...)` would spawn a subshell and lose them):
+#   LAST_QUERY_RESPONSE   — full JSON response body
+#   LAST_QUERY_RETRIES    — how many attempts before success (0..2 on OK, 3 on fail)
+#   LAST_QUERY_SKIP_TOKEN — the `$skipToken` from response, empty if last page
+#
+# Args:
+#   $1  KQL query string
+#   $2  skip_token (empty for first page)
 #
 # Returns 0 on success, non-zero after 3 failed attempts.
 # Failures counted: az exit != 0, OR stdout not parseable as JSON, OR the
 # expected `.data` field is missing (indicates a malformed response).
 # Backoff: 2s after 1st failure, 5s after 2nd. No sleep after last attempt.
 # ---------------------------------------------------------------------------
+ARG_REST_ENDPOINT="https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01"
 LAST_QUERY_RESPONSE=""
 LAST_QUERY_RETRIES=0
-run_graph_query() {
-    local query_file="$1"
+LAST_QUERY_SKIP_TOKEN=""
+
+run_arg_rest_query() {
+    local query="$1"
     local skip_token="${2:-}"
     local delays=(2 5)
-    local az_stderr response rc
+    local body az_stderr response rc
+
     LAST_QUERY_RESPONSE=""
     LAST_QUERY_RETRIES=0
+    LAST_QUERY_SKIP_TOKEN=""
+
+    if [ -z "$skip_token" ]; then
+        body=$(jq -nc --arg q "$query" '{query: $q, options: {"$top": 1000}}')
+    else
+        body=$(jq -nc --arg q "$query" --arg t "$skip_token" \
+            '{query: $q, options: {"$top": 1000, "$skipToken": $t}}')
+    fi
 
     for attempt in 1 2 3; do
         az_stderr=$(mktemp)
-        if [ -z "$skip_token" ]; then
-            response=$(az graph query -q "$(cat "$query_file")" \
-                        --first 1000 --output json 2>"$az_stderr")
-        else
-            response=$(az graph query -q "$(cat "$query_file")" \
-                        --first 1000 --skip-token "$skip_token" \
-                        --output json 2>"$az_stderr")
-        fi
+        response=$(az rest --method post --url "$ARG_REST_ENDPOINT" --body "$body" 2>"$az_stderr")
         rc=$?
         if [ "$rc" -eq 0 ] && printf '%s' "$response" | jq -e '.data' >/dev/null 2>&1; then
             rm -f "$az_stderr"
             LAST_QUERY_RESPONSE="$response"
+            LAST_QUERY_SKIP_TOKEN=$(printf '%s' "$response" | jq -r '.["$skipToken"] // empty' 2>/dev/null || true)
             return 0
         fi
         local err_preview
         err_preview=$(head -c 300 "$az_stderr" 2>/dev/null)
         rm -f "$az_stderr"
         LAST_QUERY_RETRIES=$attempt
-        log_warn "az graph query attempt ${attempt}/3 failed rc=${rc}: ${err_preview:-<empty stderr, invalid JSON?>}"
+        log_warn "az rest (resource graph) attempt ${attempt}/3 failed rc=${rc}: ${err_preview:-<empty stderr, invalid JSON?>}"
         if [ "$attempt" -lt 3 ]; then
             local delay="${delays[$((attempt-1))]}"
-            log_info "az graph query retry backoff=${delay}s"
+            log_info "az rest (resource graph) retry backoff=${delay}s"
             sleep "$delay"
         fi
     done
     return 1
+}
+
+# ---------------------------------------------------------------------------
+# KQL builders — small, testable, single-responsibility.
+#
+# Split into two queries by design (see erros.md Erro 4): a single JOIN over
+# 1.6M+ rows blows up ARG with UnexpectedQueryExecutionError. Instead we
+# enumerate (repo, digest) pairs first, then run the enriched JOIN per digest.
+# Each per-digest query touches ~500-3000 rows, well within ARG limits.
+# ---------------------------------------------------------------------------
+
+# Small query that lists unique (repository, digest) pairs matching the given
+# early filter. Used to drive the outer per-digest scan loop.
+build_enumerate_digests_query() {
+    local filter="${1:-}"
+    cat <<KQL
+securityresources
+| where type == "microsoft.security/assessments"
+| where properties.metadata.recommendationCategory == "SoftwareUpdate"
+| where properties.resourceDetails.ResourceType == ".containerimage"
+| where properties.resourceDetails.Source == "Azure"
+$filter
+| extend _image = parse_json(tostring(properties.resourceAdditionalData))
+| extend
+    _repository = tostring(_image.RepositoryDetails.RepositoryName),
+    _digest     = tostring(_image.Digest)
+| where isnotempty(_digest)
+| distinct _repository, _digest
+KQL
+}
+
+# Full per-digest scan with cvedetails JOIN. Projects exactly the 18 fields
+# consumed by JQ_ROW_EXTRACT downstream — do NOT reorder without updating
+# the reader in the main scan loop and the CSV header/tests.
+#
+# Filter by cvssScore >= MIN_SCORE / <= MAX_SCORE is applied at the KQL
+# level (same behavior as the previous monolithic query).
+build_digest_scan_query() {
+    local digest="$1"
+    cat <<KQL
+securityresources
+| where type == "microsoft.security/assessments"
+| where properties.metadata.recommendationCategory == "SoftwareUpdate"
+| where properties.resourceDetails.ResourceType == ".containerimage"
+| where properties.resourceDetails.Source == "Azure"
+| extend
+    _scanner = parse_json(tostring(properties.additionalData.ScannersDetails)),
+    _image   = parse_json(tostring(properties.resourceAdditionalData)),
+    _cves    = parse_json(tostring(properties.additionalData.CvesDetails))
+| extend _digest = tostring(_image.Digest)
+| where _digest == "$digest"
+| mv-expand cve = _cves
+| extend cveId = coalesce(tostring(cve.CveId), tostring(cve.cveId))
+| where isnotempty(cveId)
+| join kind=leftouter (
+    securityresources
+    | where type =~ "microsoft.security/cvedetails"
+    | where tostring(properties.status) !~ "Reject"
+    | extend _cveIdJoin = coalesce(tostring(properties.cveId), tostring(name))
+    | where isnotempty(_cveIdJoin)
+    | extend _cvss40 = todouble(properties.cvss["4.0"].base)
+    | extend _cvss31 = todouble(properties.cvss["3.1"].base)
+    | extend _cvss30 = todouble(properties.cvss["3.0"].base)
+    | extend _cvss20 = todouble(properties.cvss["2.0"].base)
+    | extend _cvssEnrich = coalesce(_cvss40, _cvss31, _cvss30, _cvss20)
+    | extend _publishedDateEnrich = todatetime(properties.publishedDate)
+    | extend _severityEnrich = tostring(properties.severity)
+    | extend _verifiedExpEnrich = iff(isnull(properties.exploitabilityDetails.IsVerified), false, tobool(properties.exploitabilityDetails.IsVerified))
+    | extend _publishedExpEnrich = iff(isnull(properties.exploitabilityDetails.IsPubliclyDisclosed), false, tobool(properties.exploitabilityDetails.IsPubliclyDisclosed))
+    | extend _inExploitKitEnrich = iff(isnull(properties.exploitabilityDetails.IsInExploitKit), false, tobool(properties.exploitabilityDetails.IsInExploitKit))
+    | summarize
+        _cvssEnrich = max(_cvssEnrich),
+        _publishedDateEnrich = take_any(_publishedDateEnrich),
+        _severityEnrich = take_any(_severityEnrich),
+        _verifiedExpEnrich = max(toint(_verifiedExpEnrich)),
+        _publishedExpEnrich = max(toint(_publishedExpEnrich)),
+        _inExploitKitEnrich = max(toint(_inExploitKitEnrich))
+      by cveId = _cveIdJoin
+  ) on cveId
+| project-away cveId1
+| extend
+    repository = tostring(_image.RepositoryDetails.RepositoryName),
+    digest     = _digest,
+    lastPushedToRegistryUTC = tostring(coalesce(
+        _image.LastPushedToRegistryUTC,
+        _image.RepositoryDetails.LastPushedToRegistryUTC
+    )),
+    packageName = tostring(coalesce(
+        properties.additionalData.SoftwareName,
+        properties.additionalData.softwareName
+    )),
+    currentVersion = case(
+        array_length(_scanner.mdvm.DetectedSoftwareVersions) > 0,
+            strcat_array(_scanner.mdvm.DetectedSoftwareVersions, ", "),
+        array_length(_scanner.agentlessmdvm.DetectedSoftwareVersions) > 0,
+            strcat_array(_scanner.agentlessmdvm.DetectedSoftwareVersions, ", "),
+        tostring(properties.additionalData.DetectedSoftwareVersions)
+    ),
+    fixedVersion = tostring(coalesce(
+        _scanner.mdvm.FixedVersion,
+        _scanner.agentlessmdvm.FixedVersion,
+        properties.additionalData.FixedVersion,
+        cve.FixedVersion,
+        cve.fixedVersion
+    )),
+    fixStatus = tostring(coalesce(
+        cve.FixStatus,
+        cve.fixStatus,
+        properties.additionalData.FixStatus,
+        _scanner.mdvm.FixStatus
+    )),
+    packageCategory = tostring(coalesce(
+        properties.additionalData.PackageType,
+        _scanner.mdvm.category,
+        _scanner.mdvm.PackageType
+    )),
+    packageLanguage = tostring(coalesce(
+        properties.additionalData.Language,
+        _scanner.mdvm.Language
+    )),
+    remediation = tostring(coalesce(
+        cve.Description,
+        properties.remediation,
+        properties.description
+    )),
+    severityRaw = tostring(coalesce(_severityEnrich, cve.Severity)),
+    cvssScore = coalesce(
+        _cvssEnrich,
+        todouble(cve.Cvss[0].Value.Base),
+        case(
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Critical", 9.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "High",     7.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Medium",   4.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Low",      0.1,
+            0.0
+        )
+    ),
+    cveAgeDays = iff(
+        isnotnull(_publishedDateEnrich),
+        datetime_diff('day', now(), _publishedDateEnrich),
+        long(-1)
+    ),
+    isInExploitKit      = iff(tobool(_inExploitKitEnrich) == true, "true", "false"),
+    hasPublishedExploit = iff(tobool(_publishedExpEnrich) == true, "true", "false"),
+    hasVerifiedExploit  = iff(tobool(_verifiedExpEnrich)  == true, "true", "false")
+| extend patchable = case(
+    fixStatus =~ "FixAvailable", "true",
+    fixStatus in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
+    isnotempty(fixedVersion), "true",
+    ""
+  )
+| where cveId startswith "CVE-" and cvssScore >= $MIN_SCORE and cvssScore <= $MAX_SCORE
+| project
+    repository, digest, cvssScore, cveId, severityRaw,
+    packageCategory, packageLanguage, packageName, currentVersion, fixedVersion,
+    patchable, remediation, fixStatus, cveAgeDays,
+    isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC
+| distinct
+    repository, digest, cvssScore, cveId, severityRaw,
+    packageCategory, packageLanguage, packageName, currentVersion, fixedVersion,
+    patchable, remediation, fixStatus, cveAgeDays,
+    isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC
+| order by cvssScore desc, repository asc
+KQL
 }
 
 # Function to display usage
@@ -794,20 +983,20 @@ if [ "$DRY_RUN" = false ] && [ "$AUTO_APPROVE" = false ] && ([ "$BLOCK_IMAGES" =
     echo ""
 fi
 
-# Build the KQL Query using temp file to avoid bash escaping issues
-QUERY_FILE=$(mktemp)
-# Cleanup: always remove the KQL temp file; also remove the partial CSV tmp
-# if we exited before the final rename. When the loop succeeds we unset
-# REPORT_TMP so the trap leaves the final report in place.
-trap 'rm -f "$QUERY_FILE" ${REPORT_TMP:+"$REPORT_TMP"}' EXIT
+# Cleanup: remove the partial CSV tmp if we exit before the final rename.
+# When the scan loop succeeds we unset REPORT_TMP so the trap leaves the
+# final report in place. No temp KQL file anymore — queries are built as
+# strings by the KQL builder functions above and passed directly to
+# `run_arg_rest_query` via jq's `--arg`.
+trap 'rm -f ${REPORT_TMP:+"$REPORT_TMP"}' EXIT
 
-# Pre-compute early filter snippets to inject INSIDE each leg before extends/mv-expand.
-# This lets ARG push the filters down and avoid scanning the whole subscription.
-EARLY_FILTER_A=""
+# Pre-compute the early filter snippet used by the digest ENUMERATION query.
+# ARG pushes this filter down so enumeration doesn't scan the whole tenant.
+# The per-digest scan query does NOT need this filter — it uses the exact
+# digest string to filter, which is even tighter.
 EARLY_FILTER_B=""
 
 if [ -n "$SCAN_REPOSITORY" ]; then
-    EARLY_FILTER_A="| where properties.additionalData.artifactDetails.repositoryName == \"$SCAN_REPOSITORY\""
     _REPO_DASHED=$(repo_to_dashed_path "$SCAN_REPOSITORY")
     EARLY_FILTER_B="| where properties.resourceDetails.Id contains \"$_REPO_DASHED\""
     if [ -n "$SCAN_DIGEST" ]; then
@@ -815,249 +1004,236 @@ if [ -n "$SCAN_REPOSITORY" ]; then
         EARLY_FILTER_B="$EARLY_FILTER_B and properties.resourceDetails.Id contains \"$_DIGEST_HEX\""
     fi
 elif [ -n "$REPOSITORY" ]; then
-    EARLY_FILTER_A="| where properties.additionalData.artifactDetails.repositoryName contains \"$REPOSITORY\""
     _REPO_DASHED=$(repo_to_dashed_path "$REPOSITORY")
     EARLY_FILTER_B="| where properties.resourceDetails.Id contains \"$_REPO_DASHED\""
 elif [ -n "$REPOSITORIES" ]; then
-    # CONTROLLED list semantics (task #38): exact match, not substring.
-    # Leg A uses KQL `in (...)`. Leg B uses `contains "repositories-<dashed>-images-"`
-    # — the `repositories-…-images-` bracketing is the exact-match anchor for
-    # the SoftwareUpdate `resourceDetails.Id` format, so `app` never captures
-    # `myapp` or `app-backend`.
+    # CONTROLLED list semantics: exact match, not substring. Uses
+    # `contains "repositories-<dashed>-images-"` — the bracketing is the
+    # exact-match anchor for the SoftwareUpdate `resourceDetails.Id` format,
+    # so `app` never captures `myapp` or `app-backend`.
     mapfile -t _repos_list < <(parse_repo_list "$REPOSITORIES")
-    _expr_a=$(build_repos_in_expr \
-        "properties.additionalData.artifactDetails.repositoryName" \
-        "${_repos_list[@]}")
-    EARLY_FILTER_A="| where $_expr_a"
     _expr_b=$(build_repos_id_anchor_expr \
         "properties.resourceDetails.Id" \
         "${_repos_list[@]}")
     EARLY_FILTER_B="| where $_expr_b"
 fi
 
-# Union of both assessment shapes to ensure full coverage:
-# Leg A: MDVM subassessments (c0b7cfc6-... key) — preferred schema with rich fields.
-# Leg B: Grouped SoftwareUpdate assessments — still populated in many ACR environments.
-cat > "$QUERY_FILE" << ENDQUERY
+# --- LEGACY KQL DEPRECATED --------------------------------------------------
+# The monolithic query below (with `let cvedetails = ...; ... | join ...`) was
+# retired in the 2026-09 refactor. See erros.md — it hit two ARG-side issues
+# that empty-out the CSV in prod:
+#   (a) top-level `let` returns null JOINs silently in ARG (subset of Kusto).
+#   (b) even with `let` fixed, JOIN over 1.6M+ rows blows up the ARG engine
+#       with `UnexpectedQueryExecutionError`.
+# Replacement: enumerate (repo, digest) pairs first, then run the enriched
+# JOIN per-digest (small dataset, ARG stable). See build_enumerate_digests_query
+# and build_digest_scan_query above.
+# ---------------------------------------------------------------------------
+: <<'DEPRECATED_KQL'
+let cvedetails =
+    securityresources
+    | where type == "microsoft.security/cvedetails"
+    | where tostring(properties.status) !~ "Reject"
+    | extend cveIdJoin = toupper(tostring(properties.cveId))
+    | extend
+        _cvssEnrich = todouble(coalesce(
+            properties.cvss["4.0"].base,
+            properties.cvss["3.0"].base,
+            properties.cvss["2.0"].base
+        )),
+        _severityEnrich       = tostring(properties.severity),
+        _publishedDateEnrich  = todatetime(properties.publishedDate),
+        _inExploitKitEnrich   = tobool(properties.exploitabilityDetails.IsInExploitKit),
+        _publishedExpEnrich   = tobool(properties.exploitabilityDetails.IsPubliclyDisclosed),
+        _verifiedExpEnrich    = tobool(properties.exploitabilityDetails.IsVerified)
+    | project cveIdJoin, _cvssEnrich, _severityEnrich, _publishedDateEnrich,
+              _inExploitKitEnrich, _publishedExpEnrich, _verifiedExpEnrich;
 securityresources
-| where type =~ "microsoft.security/assessments/subassessments"
-| where id contains "/assessments/c0b7cfc6-3172-465a-b378-53c7ff2cc0d5/"
-$EARLY_FILTER_A
+| where type == "microsoft.security/assessments"
+| where properties.metadata.recommendationCategory == "SoftwareUpdate"
+| where properties.resourceDetails.ResourceType == ".containerimage"
+| where properties.resourceDetails.Source == "Azure"
+$EARLY_FILTER_B
 | extend
-    cveId = tostring(properties.id),
+    _scanner = parse_json(tostring(properties.additionalData.ScannersDetails)),
+    _image   = parse_json(tostring(properties.resourceAdditionalData)),
+    _cves    = parse_json(tostring(properties.additionalData.CvesDetails))
+| mv-expand cve = _cves
+| extend cveId = tostring(cve.CveId)
+| where isnotempty(cveId)
+| extend cveIdJoin = toupper(cveId)
+| join kind=leftouter cvedetails on cveIdJoin
+| extend
+    repository = tostring(_image.RepositoryDetails.RepositoryName),
+    digest     = tostring(_image.Digest),
+    lastPushedToRegistryUTC = tostring(coalesce(
+        _image.LastPushedToRegistryUTC,
+        _image.RepositoryDetails.LastPushedToRegistryUTC
+    )),
+    packageName    = tostring(properties.additionalData.SoftwareName),
+    currentVersion = tostring(_scanner.mdvm.DetectedSoftwareVersions[0]),
+    fixedVersion   = tostring(cve.FixedVersion),
+    packageCategory = tostring(coalesce(
+        properties.additionalData.PackageType,
+        _scanner.mdvm.category,
+        _scanner.mdvm.PackageType
+    )),
+    packageLanguage = tostring(coalesce(
+        properties.additionalData.Language,
+        _scanner.mdvm.Language
+    )),
+    fixStatus = tostring(coalesce(
+        cve.FixStatus,
+        properties.additionalData.FixStatus,
+        _scanner.mdvm.FixStatus
+    )),
+    remediation = tostring(coalesce(
+        cve.Description,
+        properties.remediation,
+        properties.description
+    )),
+    severityRaw = tostring(coalesce(_severityEnrich, cve.Severity)),
     cvssScore = coalesce(
-        todouble(properties.additionalData.cvssV30Score),
+        _cvssEnrich,
+        todouble(cve.Cvss[0].Value.Base),
         case(
-            properties.additionalData.vulnerabilityDetails.severity =~ "Critical", 9.0,
-            properties.additionalData.vulnerabilityDetails.severity =~ "High",     7.0,
-            properties.additionalData.vulnerabilityDetails.severity =~ "Medium",   4.0,
-            properties.additionalData.vulnerabilityDetails.severity =~ "Low",      0.1,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Critical", 9.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "High",     7.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Medium",   4.0,
+            tostring(coalesce(_severityEnrich, cve.Severity)) =~ "Low",      0.1,
             0.0
         )
     ),
-    digest = tostring(properties.additionalData.artifactDetails.digest),
-    repository = tostring(properties.additionalData.artifactDetails.repositoryName),
-    lastPushedToRegistryUTC = tostring(properties.additionalData.artifactDetails.lastPushedToRegistryUTC),
-    packageCategory = tostring(properties.additionalData.softwareDetails.category),
-    packageLanguage = tostring(properties.additionalData.softwareDetails.language),
-    packageName = tostring(properties.additionalData.softwareDetails.packageName),
-    currentVersion = tostring(properties.additionalData.softwareDetails.version),
-    fixedVersion = coalesce(
-        tostring(properties.additionalData.softwareDetails.fixedVersion),
-        tostring(properties.additionalData.vulnerabilityDetails.fixedVersion)
-    ),
-    patchable = case(
-        tostring(properties.additionalData.softwareDetails.fixStatus) =~ "FixAvailable", "true",
-        tostring(properties.additionalData.softwareDetails.fixStatus) in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
-        isnotnull(properties.additionalData.patchable), tostring(properties.additionalData.patchable),
-        isnotnull(properties.additionalData.vulnerabilityDetails.isPatchable), tostring(properties.additionalData.vulnerabilityDetails.isPatchable),
-        ""
-    ),
-    remediation = tostring(properties.remediation),
-    severityRaw = tostring(properties.status.severity),
-    fixStatus = tostring(properties.additionalData.softwareDetails.fixStatus),
     cveAgeDays = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.publishedDate),
-        datetime_diff('day', now(), todatetime(properties.additionalData.vulnerabilityDetails.publishedDate)),
+        isnotnull(coalesce(_publishedDateEnrich, todatetime(cve.PublishedDate))),
+        datetime_diff('day', now(), coalesce(_publishedDateEnrich, todatetime(cve.PublishedDate))),
         long(-1)
     ),
     isInExploitKit = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.isInExploitKit)
-            and tobool(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.isInExploitKit),
+        tobool(coalesce(
+            _inExploitKitEnrich,
+            cve.ExploitabilityDetails.IsInExploitKit
+        )) == true,
         "true", "false"
     ),
     hasPublishedExploit = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsPublished)
-            and tobool(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsPublished),
+        tobool(coalesce(
+            _publishedExpEnrich,
+            cve.ExploitabilityDetails.ExploitStepsPublished,
+            cve.ExploitabilityDetails.IsPubliclyDisclosed
+        )) == true,
         "true", "false"
     ),
     hasVerifiedExploit = iff(
-        isnotnull(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsVerified)
-            and tobool(properties.additionalData.vulnerabilityDetails.exploitabilityAssessment.exploitStepsVerified),
+        tobool(coalesce(
+            _verifiedExpEnrich,
+            cve.ExploitabilityDetails.ExploitStepsVerified,
+            cve.ExploitabilityDetails.IsVerified
+        )) == true,
         "true", "false"
     )
+| extend patchable = case(
+    fixStatus =~ "FixAvailable", "true",
+    fixStatus in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
+    isnotempty(fixedVersion), "true",
+    ""
+  )
 | where cveId startswith "CVE-" and cvssScore >= $MIN_SCORE and cvssScore <= $MAX_SCORE
 | project repository, digest, cvssScore, cveId, severityRaw, packageCategory, packageLanguage, packageName, currentVersion, fixedVersion, patchable, remediation, fixStatus, cveAgeDays, isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC
-| union (securityresources
-    | where type =~ "microsoft.security/assessments"
-    | where properties.metadata.recommendationCategory == "SoftwareUpdate"
-    | where properties.resourceDetails.ResourceType == ".containerimage"
-    | where properties.resourceDetails.Source == "Azure"
-    $EARLY_FILTER_B
-    | extend
-        _rad = parse_json(tostring(properties.resourceAdditionalData)),
-        _dashedPath = extract(@"repositories-(.+)-images-sha256:[a-f0-9]+", 1, tostring(properties.resourceDetails.Id)),
-        _resourceName = tostring(properties.resourceDetails.ResourceName),
-        _digest = strcat("sha256:", extract(@"sha256:([a-f0-9]+)", 1, tostring(properties.resourceDetails.Id))),
-        _cvesJson = parse_json(tostring(properties.additionalData.CvesDetails)),
-        _pkgCategory = tostring(properties.additionalData.PackageType),
-        _pkgLanguage = tostring(properties.additionalData.Language),
-        _pkgName = tostring(properties.additionalData.SoftwareName)
-    | mv-expand cve = _cvesJson
-    | extend
-        cveId = tostring(cve.CveId),
-        cvssScore = coalesce(
-            todouble(cve.Cvss[0].Value.Base),
-            case(
-                cve.Severity =~ "Critical", 9.0,
-                cve.Severity =~ "High",     7.0,
-                cve.Severity =~ "Medium",   4.0,
-                cve.Severity =~ "Low",      0.1,
-                0.0
-            )
-        ),
-        repository = iff(
-            _dashedPath == _resourceName,
-            _resourceName,
-            strcat(substring(_dashedPath, 0, strlen(_dashedPath) - strlen(_resourceName) - 1), "/", _resourceName)
-        ),
-        severityRaw = tostring(cve.Severity),
-        fixStatus = tostring(cve.FixStatus),
-        fixedVersion = tostring(cve.FixedVersion),
-        patchable = case(
-            tostring(cve.FixStatus) =~ "FixAvailable", "true",
-            tostring(cve.FixStatus) in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
-            ""
-        ),
-        remediation = tostring(cve.Description),
-        cveAgeDays = iff(
-            isnotnull(cve.PublishedDate),
-            datetime_diff('day', now(), todatetime(cve.PublishedDate)),
-            long(-1)
-        ),
-        isInExploitKit = iff(
-            isnotnull(cve.ExploitabilityDetails.IsInExploitKit)
-                and tobool(cve.ExploitabilityDetails.IsInExploitKit),
-            "true", "false"
-        ),
-        hasPublishedExploit = iff(
-            isnotnull(cve.ExploitabilityDetails.ExploitStepsPublished)
-                and tobool(cve.ExploitabilityDetails.ExploitStepsPublished),
-            "true", "false"
-        ),
-        hasVerifiedExploit = iff(
-            isnotnull(cve.ExploitabilityDetails.ExploitStepsVerified)
-                and tobool(cve.ExploitabilityDetails.ExploitStepsVerified),
-            "true", "false"
-        ),
-        lastPushedToRegistryUTC = tostring(_rad.LastPushedToRegistryUTC)
-    | where cveId startswith "CVE-" and cvssScore >= $MIN_SCORE and cvssScore <= $MAX_SCORE
-    | project repository, digest=_digest, cvssScore, cveId, severityRaw, packageCategory=_pkgCategory, packageLanguage=_pkgLanguage, packageName=_pkgName, currentVersion="", fixedVersion, patchable, remediation, fixStatus, cveAgeDays, isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC)
-ENDQUERY
+DEPRECATED_KQL
 
-# Final projection and ordering
-if [ "$BLOCK_IMAGES" = false ] && [ "$UNBLOCK" = false ]; then
-    printf '%s' " | project repository, digest, cvssScore, cveId, severityRaw, packageCategory, packageLanguage, packageName, currentVersion, fixedVersion, patchable, remediation, fixStatus, cveAgeDays, isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC | distinct repository, digest, cvssScore, cveId, severityRaw, packageCategory, packageLanguage, packageName, currentVersion, fixedVersion, patchable, remediation, fixStatus, cveAgeDays, isInExploitKit, hasPublishedExploit, hasVerifiedExploit, lastPushedToRegistryUTC | order by cvssScore desc, repository asc" >> "$QUERY_FILE"
-else
-    printf '%s' " | project repository, digest | distinct repository, digest | order by repository asc" >> "$QUERY_FILE"
-fi
-
-# Debug: print query and run diagnostic preview if requested
+# Debug: print the enumerate + per-digest KQL that will actually run
 if [ "$DEBUG" = true ]; then
     echo ""
-    echo "=== [DEBUG] KQL Query gerada ==="
-    cat "$QUERY_FILE"
+    echo "=== [DEBUG] Enumerate digests KQL ==="
+    build_enumerate_digests_query "$EARLY_FILTER_B"
     echo ""
-    echo "=== [DEBUG] Diagnóstico ARG — repositórios encontrados (sem filtro de score) ==="
-    _REPO_FILTER=""
-    [ -n "$REPOSITORY" ] && _REPO_FILTER="| where properties.additionalData.artifactDetails.repositoryName contains \"$REPOSITORY\""
-    az graph query -q "securityresources | where type =~ 'microsoft.security/assessments/subassessments' | where id contains '/assessments/c0b7cfc6-3172-465a-b378-53c7ff2cc0d5/' $_REPO_FILTER | extend repository = tostring(properties.additionalData.artifactDetails.repositoryName), cvssScore = todouble(properties.additionalData.cvssV30Score) | summarize cve_count=count(), max_cvss=max(cvssScore), min_cvss=min(cvssScore) by repository | order by max_cvss desc" --output table 2>&1 || echo "[DEBUG] az graph query falhou"
+    echo "=== [DEBUG] Per-digest scan KQL (example, uses <DIGEST> placeholder) ==="
+    build_digest_scan_query "<DIGEST>"
     echo ""
 fi
 echo "Executing Azure Resource Graph query..."
 
-SKIP_TOKEN=""
 TOTAL_PROCESSED=0
-PAGE_NUM=0
+TOTAL_PAGES=0
+DIGEST_NUM=0
 
-# PR-B: tag cache is now **execution-global** (not per-page). If a repo shows
-# up in pages 1 and 3, we call `show-tags` only once — the response is the
-# whole tag list for that repo, so nothing new to learn on the second visit.
-# REPO_TAGS_TRIED tracks "already attempted" so a failed repo is not retried
-# every page (blast radius: N digests of that repo → TAG=N/A, 1 WARN total).
+# Tag cache is execution-global — one az call per unique repo, reused for
+# every digest of that repo. REPO_TAGS_TRIED tracks "already attempted"
+# (success OR fail) so a failed repo is not retried (blast radius: all
+# digests of that repo → TAG=N/A, 1 WARN total).
 declare -A TAG_CACHE=()
 declare -A REPO_TAGS_TRIED=()
 
-while : ; do
-    PAGE_NUM=$((PAGE_NUM + 1))
-    _t_page_start=$(_now_realtime)
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 0 — Enumerate (repository, digest) pairs
+#
+# Small query listing unique image identities matching the filter. Drives
+# the per-digest scan loop below. `--scan-image` with an explicit digest is
+# shortcut: we already know the pair, no ARG call needed.
+# ═════════════════════════════════════════════════════════════════════════
+declare -a DIGEST_PAIRS=()
 
-    # ── phase 1: graph_query ────────────────────────────────────────────
-    _t_graph_start=$(_now_realtime)
-    # Fail-fast: if the query keeps failing after 3 tries, abort with a clear
-    # message so operators don't consume a truncated CSV as authoritative.
-    # Call directly (no $(...)) so globals set by the function survive.
-    if ! run_graph_query "$QUERY_FILE" "$SKIP_TOKEN"; then
-        log_error "az graph query failed on page ${PAGE_NUM} after 3 attempts; aborting (processed=${TOTAL_PROCESSED} pages=$((PAGE_NUM - 1)))"
-        exit 2
+if [ -n "$SCAN_REPOSITORY" ] && [ -n "$SCAN_DIGEST" ]; then
+    DIGEST_PAIRS=("${SCAN_REPOSITORY}|${SCAN_DIGEST}")
+    log_info "enumerate: bypass (using --scan-image target directly)"
+    echo "Enumerate: 1 pair (from --scan-image)"
+else
+    _t_enum_start=$(_now_realtime)
+    _ENUM_QUERY=$(build_enumerate_digests_query "$EARLY_FILTER_B")
+    ENUM_SKIP_TOKEN=""
+    _enum_pages=0
+    while : ; do
+        _enum_pages=$((_enum_pages + 1))
+        if ! run_arg_rest_query "$_ENUM_QUERY" "$ENUM_SKIP_TOKEN"; then
+            log_error "digest enumeration failed on page ${_enum_pages} after 3 attempts; aborting"
+            exit 2
+        fi
+        mapfile -t _page_pairs < <(printf '%s' "$LAST_QUERY_RESPONSE" \
+            | jq -r '.data[] | select(._digest != null and ._digest != "") | "\(._repository)|\(._digest)"')
+        if [ "${#_page_pairs[@]}" -gt 0 ]; then
+            DIGEST_PAIRS+=("${_page_pairs[@]}")
+        fi
+        ENUM_SKIP_TOKEN="$LAST_QUERY_SKIP_TOKEN"
+        [ -z "$ENUM_SKIP_TOKEN" ] && break
+    done
+    _t_enum_ms=$(_elapsed_ms "$_t_enum_start")
+    log_info "enumerate: found ${#DIGEST_PAIRS[@]} unique pairs in ${_enum_pages} page(s) time_ms=${_t_enum_ms}"
+    echo "Enumerate: ${#DIGEST_PAIRS[@]} unique (repo, digest) pair(s)"
+fi
+
+TOTAL_DIGESTS=${#DIGEST_PAIRS[@]}
+
+if [ "$TOTAL_DIGESTS" -eq 0 ]; then
+    echo "No matching images found."
+    if [ -n "$REPORT_TMP" ]; then
+        mv -f "$REPORT_TMP" "$REPORT_FILE"
+        REPORT_TMP=""
     fi
-    RESPONSE="$LAST_QUERY_RESPONSE"
+    log_info "end total_processed=0 digests=0 report_file=${REPORT_FILE:-<none>}"
+    exit 0
+fi
 
-    # Defensive: `run_graph_query` already validated .data exists, but if jq
-    # ever hiccups we treat it as end-of-results rather than crash.
-    BATCH_COUNT=$(printf '%s' "$RESPONSE" | jq '.data | length' 2>/dev/null || echo 0)
-    _t_graph_ms=$(_elapsed_ms "$_t_graph_start")
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 1 — Resolve tags upfront (one az call per unique repo)
+#
+# Extract unique repos from DIGEST_PAIRS and fetch tag listings once each.
+# Bypass entirely if --skip-tags. Failure to fetch a repo's tags is logged
+# once and its digests fall back to TAG=N/A (never aborts the scan).
+# ═════════════════════════════════════════════════════════════════════════
+_t_tags_start=$(_now_realtime)
+_tag_api_calls=0
 
-    if [ -z "$BATCH_COUNT" ] || [ "$BATCH_COUNT" -eq 0 ]; then
-        echo "[Page ${PAGE_NUM}] batch=0 → end of results"
-        break
-    fi
+if [ "$SKIP_TAGS" = true ]; then
+    log_info "tag_resolve: skipped (--skip-tags); all rows get TAG=N/A"
+    _t_tags_ms=0
+else
+    _unique_repo_count=$(printf '%s\n' "${DIGEST_PAIRS[@]}" | awk -F'|' '{print $1}' | sort -u | wc -l)
+    log_info "tag_resolve: start unique_repos=${_unique_repo_count}"
 
-    echo "[Page ${PAGE_NUM}] batch=${BATCH_COUNT} images, total_before=${TOTAL_PROCESSED}, retries=${LAST_QUERY_RETRIES}"
-
-    # ── phase 2: tag_resolve (per-repo, execution-global cache) ─────────
-    # PR-B: previously one `show-tags` per unique digest (redundant — the
-    # response holds ALL tags of the repo). Now one call per unique repo
-    # across the whole execution:
-    #   1. jq extracts unique repos from THIS page.
-    #   2. Skip repos already resolved (or already known-failed) in a
-    #      prior page — REPO_TAGS_TRIED is the "done" set.
-    #   3. For each new repo, fetch `show-tags --detail --top 5000` once
-    #      and populate TAG_CACHE[repo@digest] for every entry, keeping
-    #      FIRST-tag-wins semantics for digests that carry multiple tags
-    #      (matches the prior "[0]" JMESPath filter).
-    #   4. Truncation guard: if the response has exactly 5000 entries the
-    #      repo may have more tags — log a WARN so operators know some
-    #      digests may fall back to N/A. Never aborts.
-    # `_tag_api_calls` counts az calls MADE this page (0 when everything
-    # was already cached from earlier pages).
-    #
-    # PR-C: --skip-tags bypasses the whole phase. TAG_CACHE stays empty,
-    # every row falls back to "N/A" via the `${...:-N/A}` default in
-    # phase 3. Timing fields still report (as 0) so the log line format
-    # stays stable for dashboards/benchmarks.
-    _t_tags_start=$(_now_realtime)
-    _tag_api_calls=0
-    if [ "$SKIP_TAGS" = true ]; then
-        _t_tags_ms=0
-        # phase 2 intentionally skipped — jump to phase 3 with empty cache.
-    else
     while IFS= read -r repo_name; do
         [ -z "$repo_name" ] && continue
-        # Repo already attempted (success OR fail) — don't re-hit az.
-        if [ -n "${REPO_TAGS_TRIED[$repo_name]+x}" ]; then
-            continue
-        fi
+        [ -n "${REPO_TAGS_TRIED[$repo_name]+x}" ] && continue
         REPO_TAGS_TRIED[$repo_name]=1
         _tag_api_calls=$((_tag_api_calls + 1))
 
@@ -1069,136 +1245,161 @@ while : ; do
             --output json 2>/dev/null || true)
 
         if [ -z "$tags_json" ] || ! printf '%s' "$tags_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            log_warn "show-tags failed for repository=$repo_name — digests in this repo will use TAG=N/A"
+            log_warn "show-tags failed for repository=${repo_name} — digests in this repo will use TAG=N/A"
             continue
         fi
 
         tag_count=$(printf '%s' "$tags_json" | jq 'length' 2>/dev/null || echo 0)
         if [ "$tag_count" = "5000" ]; then
-            log_warn "show-tags returned exactly 5000 entries for repository=$repo_name — response may be truncated; some digests may fall back to TAG=N/A"
+            log_warn "show-tags returned exactly 5000 entries for repository=${repo_name} — response may be truncated; some digests may fall back to TAG=N/A"
         fi
 
-        # Populate TAG_CACHE preserving FIRST-tag-wins for duplicate digests
-        # (jq iterates array in order; the [ -z +x ] guard keeps the first).
+        # FIRST-tag-wins for digests with multiple tags (matches previous
+        # "[0]" JMESPath filter).
         while IFS=$'\x1f' read -r d_digest d_name; do
             [ -z "$d_digest" ] && continue
             key="${repo_name}@${d_digest}"
             if [ -z "${TAG_CACHE[$key]+x}" ]; then
                 TAG_CACHE[$key]="$d_name"
             fi
-        done < <(printf '%s' "$tags_json" | jq -r '.[] | select(.digest and .name) | [.digest, .name] | join("\u001f")')
-    done < <(printf '%s' "$RESPONSE" | jq -r '[.data[].repository] | unique | .[]')
+        done < <(printf '%s' "$tags_json" | jq -r '.[] | select(.digest and .name) | [.digest, .name] | join("")')
+    done < <(printf '%s\n' "${DIGEST_PAIRS[@]}" | awk -F'|' '{print $1}' | sort -u)
+
     _t_tags_ms=$(_elapsed_ms "$_t_tags_start")
-    fi
+    log_info "tag_resolve: end api_calls=${_tag_api_calls} cached_pairs=${#TAG_CACHE[@]} time_ms=${_t_tags_ms}"
+    echo "Tags:      ${_tag_api_calls} az call(s), ${#TAG_CACHE[@]} tag(s) cached"
+fi
 
-    # ── phase 3: rows (parse + CSV write) ────────────────────────────────
-    _t_rows_start=$(_now_realtime)
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 2 — Per-digest scan with inner pagination
+#
+# For each (repo, digest) pair, run the enriched KQL (JOIN with cvedetails)
+# scoped to a single digest. Small dataset per call → ARG stable → no
+# UnexpectedQueryExecutionError. Inner while loop drains skip-token pages
+# until the digest is fully consumed. Rows stream directly to CSV — no
+# in-memory accumulation across pages.
+#
+# Fail-fast per page after 3 retries in run_arg_rest_query. Aborts the
+# whole scan (incomplete CSV is worse than obvious failure — operator can
+# re-run).
+# ═════════════════════════════════════════════════════════════════════════
+JQ_ROW_EXTRACT='
+    def clean(x): (x // "" | tostring | gsub("[\r\n]"; " "));
+    .data[] | [
+        clean(.repository),
+        clean(.digest),
+        clean(.cvssScore // "0"),
+        clean(.cveId // "N/A"),
+        clean(.severityRaw),
+        clean(.packageCategory),
+        clean(.packageLanguage),
+        clean(.packageName),
+        clean(.currentVersion),
+        clean(.fixedVersion),
+        clean(.patchable),
+        clean(.remediation),
+        clean(.fixStatus),
+        clean(.cveAgeDays),
+        clean(.isInExploitKit // "false"),
+        clean(.hasPublishedExploit // "false"),
+        clean(.hasVerifiedExploit // "false"),
+        clean(.lastPushedToRegistryUTC)
+    ] | join("")
+'
 
-    # PR-A: one jq invocation per PAGE emits every row as US-separated
-    # (0x1F) fields; the shell loop just splits with `IFS=$'\x1f' read`.
-    # Prior code did 18 (echo|base64|jq) subprocesses per row — ~340ms/row
-    # of pure shell overhead on the client. This shape spawns exactly one
-    # jq per page, regardless of row count. Field ORDER below is the CSV
-    # contract (matches csv_write_row call site and the CSV header); do
-    # not reorder without updating the reader below AND the tests.
-    # `clean` collapses \r, \n and 0x1F inside string fields so multi-line
-    # remediation text never breaks the delimiter or the row boundary.
-    JQ_ROW_EXTRACT='
-        def clean(x): (x // "" | tostring | gsub("[\r\n\u001f]"; " "));
-        .data[] | [
-            clean(.repository),
-            clean(.digest),
-            clean(.cvssScore // "0"),
-            clean(.cveId // "N/A"),
-            clean(.severityRaw),
-            clean(.packageCategory),
-            clean(.packageLanguage),
-            clean(.packageName),
-            clean(.currentVersion),
-            clean(.fixedVersion),
-            clean(.patchable),
-            clean(.remediation),
-            clean(.fixStatus),
-            clean(.cveAgeDays),
-            clean(.isInExploitKit // "false"),
-            clean(.hasPublishedExploit // "false"),
-            clean(.hasVerifiedExploit // "false"),
-            clean(.lastPushedToRegistryUTC)
-        ] | join("\u001f")
-    '
+for pair in "${DIGEST_PAIRS[@]}"; do
+    DIGEST_NUM=$((DIGEST_NUM + 1))
+    _repo="${pair%%|*}"
+    _digest="${pair##*|}"
+    _t_digest_start=$(_now_realtime)
+    _digest_rows_before=$TOTAL_PROCESSED
+    _digest_pages=0
 
-    while IFS=$'\x1f' read -r \
-        REPO DIGEST CVSS_SCORE CVE_ID SEVERITY_RAW \
-        PKG_CATEGORY PKG_LANGUAGE PKG_NAME CURRENT_VERSION FIXED_VERSION \
-        PATCHABLE REMEDIATION FIX_STATUS CVE_AGE_DAYS \
-        IN_EXPLOIT_KIT PUB_EXPLOIT VER_EXPLOIT LAST_PUSHED; do
+    _SCAN_QUERY=$(build_digest_scan_query "$_digest")
+    SCAN_SKIP_TOKEN=""
 
-        # Filter by specific digest if --scan-image was used
-        if [ -n "$SCAN_DIGEST" ] && [ "$DIGEST" != "$SCAN_DIGEST" ]; then
-            continue
+    while : ; do
+        _digest_pages=$((_digest_pages + 1))
+        if ! run_arg_rest_query "$_SCAN_QUERY" "$SCAN_SKIP_TOKEN"; then
+            log_error "scan failed digest_short=${_digest:(-12)} repo=${_repo} page=${_digest_pages} after 3 attempts; aborting (processed=${TOTAL_PROCESSED} digests=$((DIGEST_NUM - 1))/${TOTAL_DIGESTS})"
+            exit 2
+        fi
+        RESPONSE="$LAST_QUERY_RESPONSE"
+
+        BATCH_COUNT=$(printf '%s' "$RESPONSE" | jq '.data | length' 2>/dev/null || echo 0)
+        if [ -z "$BATCH_COUNT" ] || [ "$BATCH_COUNT" -eq 0 ]; then
+            _digest_pages=$((_digest_pages - 1))
+            break
         fi
 
-        # Severity: Defender raw is authoritative; fall back to CVSS-derived.
-        if [ -n "$SEVERITY_RAW" ]; then
-            SEVERITY="$SEVERITY_RAW"
-        else
-            SEVERITY=$(classify_severity "$CVSS_SCORE")
-        fi
+        # ── row processing (stream: no accumulation) ─────────────────────
+        # One jq invocation per PAGE emits every row as US-separated (0x1F)
+        # fields; the shell loop splits with `IFS=$'\x1f' read`. Field
+        # ORDER is the CSV contract (matches csv_write_row call site and
+        # the CSV header) — do not reorder without updating JQ_ROW_EXTRACT
+        # AND the tests.
+        while IFS=$'\x1f' read -r \
+            REPO DIGEST CVSS_SCORE CVE_ID SEVERITY_RAW \
+            PKG_CATEGORY PKG_LANGUAGE PKG_NAME CURRENT_VERSION FIXED_VERSION \
+            PATCHABLE REMEDIATION FIX_STATUS CVE_AGE_DAYS \
+            IN_EXPLOIT_KIT PUB_EXPLOIT VER_EXPLOIT LAST_PUSHED; do
 
-        IMAGE_ID="${REPO}@${DIGEST}"
-
-        # Retrieve tag from cache (resolved once per unique digest above)
-        TAG="${TAG_CACHE[${REPO}@${DIGEST}]:-N/A}"
-
-        # Report-only mode (default): write all columns to CSV
-        if [ "$BLOCK_IMAGES" = false ] && [ "$UNBLOCK" = false ]; then
-            csv_write_row \
-                "$REPO" "$DIGEST" "$TAG" "$CVSS_SCORE" "$CVE_ID" "$SEVERITY" \
-                "$PKG_CATEGORY" "$PKG_LANGUAGE" "$PKG_NAME" "$CURRENT_VERSION" "$FIXED_VERSION" \
-                "$PATCHABLE" "$REMEDIATION" "$FIX_STATUS" \
-                "$CVE_AGE_DAYS" "$IN_EXPLOIT_KIT" "$PUB_EXPLOIT" "$VER_EXPLOIT" \
-                "$LAST_PUSHED" >> "$REPORT_TMP"
-            TOTAL_PROCESSED=$((TOTAL_PROCESSED + 1))
-            continue
-        fi
-
-        # Determine action based on UNBLOCK flag
-        if [ "$UNBLOCK" = true ]; then
-            ACTION="unblock"
-            READ_ENABLED="true"
-        else
-            ACTION="block"
-            READ_ENABLED="false"
-        fi
-        
-        if [ "$DRY_RUN" = true ]; then
-            echo "[DRY-RUN] Would $ACTION: $IMAGE_ID (in $ACR_NAME)"
-            echo "Command: az acr repository update --name $ACR_NAME --image $IMAGE_ID --read-enabled $READ_ENABLED"
-        else
-            echo "${ACTION^}ing image: $IMAGE_ID"
-            if az acr repository update --name "$ACR_NAME" --image "$IMAGE_ID" --read-enabled "$READ_ENABLED"; then
-                echo "Successfully ${ACTION}ed $IMAGE_ID"
+            # Severity: Defender raw is authoritative; fall back to CVSS-derived.
+            if [ -n "$SEVERITY_RAW" ]; then
+                SEVERITY="$SEVERITY_RAW"
             else
-                echo "Failed to $ACTION $IMAGE_ID"
+                SEVERITY=$(classify_severity "$CVSS_SCORE")
             fi
-        fi
-        
-        TOTAL_PROCESSED=$((TOTAL_PROCESSED + 1))
-    done < <(printf '%s' "$RESPONSE" | jq -r "$JQ_ROW_EXTRACT")
-    _t_rows_ms=$(_elapsed_ms "$_t_rows_start")
-    _t_total_ms=$(_elapsed_ms "$_t_page_start")
 
-    echo "[Page ${PAGE_NUM}] done, total_after=${TOTAL_PROCESSED}"
-    # Structured per-page timing, one line per page. Stable format for
-    # dashboards and benchmark parsing — do not reorder without updating
-    # scripts/benchmark-defender.sh.
-    log_info "page ${PAGE_NUM} batch=${BATCH_COUNT} total=${TOTAL_PROCESSED} retries=${LAST_QUERY_RETRIES} tag_api_calls=${_tag_api_calls} timings_ms=graph_query:${_t_graph_ms} tag_resolve:${_t_tags_ms} rows:${_t_rows_ms} total:${_t_total_ms}"
+            IMAGE_ID="${REPO}@${DIGEST}"
+            TAG="${TAG_CACHE[${REPO}@${DIGEST}]:-N/A}"
 
-    # Check for next page
-    SKIP_TOKEN=$(printf '%s' "$RESPONSE" | jq -r '.skip_token // empty' 2>/dev/null || true)
-    if [ -z "$SKIP_TOKEN" ]; then
-        break
-    fi
+            # Report-only mode (default): write all columns to CSV.
+            if [ "$BLOCK_IMAGES" = false ] && [ "$UNBLOCK" = false ]; then
+                csv_write_row \
+                    "$REPO" "$DIGEST" "$TAG" "$CVSS_SCORE" "$CVE_ID" "$SEVERITY" \
+                    "$PKG_CATEGORY" "$PKG_LANGUAGE" "$PKG_NAME" "$CURRENT_VERSION" "$FIXED_VERSION" \
+                    "$PATCHABLE" "$REMEDIATION" "$FIX_STATUS" \
+                    "$CVE_AGE_DAYS" "$IN_EXPLOIT_KIT" "$PUB_EXPLOIT" "$VER_EXPLOIT" \
+                    "$LAST_PUSHED" >> "$REPORT_TMP"
+                TOTAL_PROCESSED=$((TOTAL_PROCESSED + 1))
+                continue
+            fi
+
+            # Block/unblock modes.
+            if [ "$UNBLOCK" = true ]; then
+                ACTION="unblock"
+                READ_ENABLED="true"
+            else
+                ACTION="block"
+                READ_ENABLED="false"
+            fi
+
+            if [ "$DRY_RUN" = true ]; then
+                echo "[DRY-RUN] Would $ACTION: $IMAGE_ID (in $ACR_NAME)"
+                echo "Command: az acr repository update --name $ACR_NAME --image $IMAGE_ID --read-enabled $READ_ENABLED"
+            else
+                echo "${ACTION^}ing image: $IMAGE_ID"
+                if az acr repository update --name "$ACR_NAME" --image "$IMAGE_ID" --read-enabled "$READ_ENABLED"; then
+                    echo "Successfully ${ACTION}ed $IMAGE_ID"
+                else
+                    echo "Failed to $ACTION $IMAGE_ID"
+                fi
+            fi
+
+            TOTAL_PROCESSED=$((TOTAL_PROCESSED + 1))
+        done < <(printf '%s' "$RESPONSE" | jq -r "$JQ_ROW_EXTRACT")
+
+        SCAN_SKIP_TOKEN="$LAST_QUERY_SKIP_TOKEN"
+        [ -z "$SCAN_SKIP_TOKEN" ] && break
+    done
+
+    _digest_rows=$((TOTAL_PROCESSED - _digest_rows_before))
+    _t_digest_ms=$(_elapsed_ms "$_t_digest_start")
+    TOTAL_PAGES=$((TOTAL_PAGES + _digest_pages))
+
+    echo "[${DIGEST_NUM}/${TOTAL_DIGESTS}] ${_repo} @${_digest:(-12)}: ${_digest_rows} row(s), ${_digest_pages} page(s), ${_t_digest_ms}ms"
+    log_info "digest ${DIGEST_NUM}/${TOTAL_DIGESTS} repo=${_repo} digest_short=${_digest:(-12)} pages=${_digest_pages} rows=${_digest_rows} time_ms=${_t_digest_ms}"
 done
 
 # All pages processed successfully — promote the tmp CSV to the final name
@@ -1211,10 +1412,10 @@ fi
 echo "--------------------------------------------------"
 echo "Processing complete."
 if [ "$BLOCK_IMAGES" = false ] && [ "$UNBLOCK" = false ]; then
-    echo "Total images found: $TOTAL_PROCESSED across ${PAGE_NUM} page(s)"
+    echo "Total rows found: ${TOTAL_PROCESSED} across ${TOTAL_DIGESTS} digest(s), ${TOTAL_PAGES} page(s)"
     echo "Report saved to: $REPORT_FILE"
-    log_info "end total_processed=${TOTAL_PROCESSED} pages=${PAGE_NUM} report_file=${REPORT_FILE}"
+    log_info "end total_processed=${TOTAL_PROCESSED} digests=${TOTAL_DIGESTS} pages=${TOTAL_PAGES} report_file=${REPORT_FILE}"
 else
-    echo "Total images processed: $TOTAL_PROCESSED across ${PAGE_NUM} page(s)"
-    log_info "end total_processed=${TOTAL_PROCESSED} pages=${PAGE_NUM} mode=${_LOG_MODE}"
+    echo "Total actions taken: ${TOTAL_PROCESSED} across ${TOTAL_DIGESTS} digest(s), ${TOTAL_PAGES} page(s)"
+    log_info "end total_processed=${TOTAL_PROCESSED} digests=${TOTAL_DIGESTS} pages=${TOTAL_PAGES} mode=${_LOG_MODE}"
 fi
