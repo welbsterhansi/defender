@@ -13,12 +13,20 @@ Primary consumers: platform SRE team (report), developers (remediation actions),
 ## Architecture
 
 ```
-┌────────────┐      ┌──────────────────────────┐
-│ defender.sh│─────▶│ vulnerable_images_report │
-│  (ACR/KQL) │      │        .csv (19 cols)    │
-└────────────┘      └────────────┬─────────────┘
-                                 │
-┌────────────┐                   ▼
+┌────────────────────────────┐      ┌──────────────────────────┐
+│ defender.sh                │─────▶│ vulnerable_images_report │
+│  Phase 0: enumerate        │      │        .csv (19 cols)    │
+│  Phase 1: tag_resolve      │      └────────────┬─────────────┘
+│  Phase 2a: batched assess. │                   │
+│  Phase 2b: unique CVE IDs  │                   │
+│  Phase 2c: batched cvedet. │                   │
+│  Phase 2d: enrich (python) │                   │
+└────────────────────────────┘                   │
+        │                                        │
+        └── invokes ──▶ enrich_cvedetails.py     │
+                       (Python 3.9+, stdlib only)│
+                                                 │
+┌────────────┐                                   ▼
 │check_ocp.sh│──── oc get pods ──▶ ┌───────────────────────────┐
 │  (OCP xref)│                     │ resultado_cruzamento.csv  │
 └────────────┘                     │        (24 cols)          │
@@ -41,11 +49,23 @@ Primary consumers: platform SRE team (report), developers (remediation actions),
                                      └─────────────────────┘
 ```
 
+**P2 architecture (2026-09):** `defender.sh` uses a two-phase batched
+scan in **report-only** mode (Phase 2a/b/c/d above). **Block/unblock**
+modes stay on the legacy per-digest path — same query per digest as
+before, with cvedetails JOIN inline. Details in
+`docs/mdvm-two-phase-benchmark.md`.
+
+**Python dependency:** `defender.sh` now invokes `enrich_cvedetails.py`
+in Phase 2d for the local merge. The file must be co-located with
+`defender.sh` (`$(dirname "$0")/enrich_cvedetails.py`); missing helper
+aborts the scan with a clear error. Stdlib only — no pip installs.
+
 ## Files
 
 | File                  | Language | Role |
 |-----------------------|----------|------|
-| `defender.sh`         | Bash     | Queries Azure Resource Graph (KQL) for CVEs on ACR images. Supports block/unblock/list/scan modes. |
+| `defender.sh`         | Bash     | Queries Azure Resource Graph (KQL) via `az rest` for CVEs on ACR images. Report-only mode uses two-phase batched (Phase 2a/2c) + local merge via `enrich_cvedetails.py`; block/unblock modes use legacy per-digest path. Supports block/unblock/list/scan modes. |
+| `enrich_cvedetails.py`| Python   | Local merge helper invoked by `defender.sh` in Phase 2d (report-only). Reads `assessments.jsonl` + `cvedetails.jsonl` produced by batched ARG queries, merges by `toupper(cveId)`, applies min/max score filter, and writes the final 19-column CSV. Must be co-located with `defender.sh`. Python 3.9+, stdlib only. |
 | `check_ocp.sh`        | Bash     | For each OpenShift project, list running pods and cross-reference their image digests with the CVE CSV. Emits a flat (workload × image × CVE) CSV. Classifies each namespace into one of five states (`SUCCESS_WITH_PODS`, `NO_PODS`, `RBAC_ERR`, `OC_ERR`, `PARSE_ERR`) and prints a coverage summary; exit `0` = complete, exit `3` = partial coverage. |
 | `group_findings.py`   | Python   | Called by `check_ocp.sh` to aggregate the flat CSV into one row per unique `(namespace, workload, image)` — CVE list, severity map, max CVSS, carried package/exploit fields. Was previously inline `python3 -c '...'`. |
 | `expandcsv.py`        | Python   | Explodes the grouped CSV into one row per unique `(namespace, workload, repository, digest, cveId)`. Uses a 3-level lookup (full → repo+cve → digest-prefix) to tolerate multi-arch manifests. |
@@ -57,7 +77,7 @@ Primary consumers: platform SRE team (report), developers (remediation actions),
 
 ## Running the pipeline
 
-Prerequisites: `az` CLI (logged in), `oc` CLI (logged in), `jq`, `bc`, Python 3.11+.
+Prerequisites: `az` CLI (logged in with **Security Reader at tenant scope** so `microsoft.security/cvedetails` enrichment is visible), `oc` CLI (logged in), `jq`, `bc`, `python3` ≥ 3.9 (used by `defender.sh` for the Phase 2d merge helper — stdlib only, no pip installs required).
 
 ```bash
 # 1. Scan ACR for CVEs (report-only by default; --block-images to enforce)
@@ -169,3 +189,33 @@ HAS_VERIFIED_EXPLOIT, LAST_PUSHED_TO_REGISTRY_UTC
 - `check_ocp.sh` filters out `openshift-*`, `kube-*`, `default`, `logging`, `monitoring` namespaces to avoid noise from platform-managed workloads.
 - **Trust the report only when `check_ocp.sh` prints `COVERAGE: COMPLETE`.** Exit code `3` means at least one namespace failed (typically RBAC) and the report is missing workloads. Distributing a partial report as authoritative is the failure mode this classification exists to prevent.
 - `make smoke-real ACR_NAME=<acr>` is the only Make target that touches real infrastructure; it runs in the tightest safe band (CVSS 9.8–10, report-only). No target ever runs block/unblock.
+
+## Python API-first migration (planned, in backlog)
+
+Tasks **P0.1–P0.8** track the migration of the pipeline to a new Python
+package `defender_pipeline/` that uses **Azure SDKs and Kubernetes
+Python client directly** — no `az`/`az rest`/`az acr`/`oc`/`subprocess`
+in the main path. Rationale: performance, testability, modularity,
+robustness of retry/backoff, observability, and reduced dependency on
+the local CLI toolchain.
+
+### Guardrails for AI assistants working on the migration
+
+- **Do NOT rewrite the new Python path as a `subprocess.run(["az", ...])`
+  wrapper.** Use `azure-identity`, `azure-mgmt-resourcegraph`,
+  `azure-containerregistry`, `kubernetes` (Python client) instead.
+  `subprocess` is only acceptable as a **temporary, explicitly-justified
+  fallback** — never as the architecture.
+- **Do NOT alter `defender.sh` during the migration.** It stays as the
+  stable production baseline. The Python path lives in a separate
+  package (`defender_pipeline/`) and is validated in parallel.
+- **CSV contracts are frozen.** `vulnerable_images_report.csv` (19 cols),
+  `resultado_cruzamento.csv` (24 cols), `expanded.csv` (22 cols) and
+  `vulnerability_report.html` must remain byte-identical / semantically
+  equivalent until an approved deprecation plan (task P0.8) says
+  otherwise. The Python path must diff clean against the bash outputs
+  before any cutover.
+- **Order of work is enforced by task blocking**: P0.1 (docs) → P0.2
+  (contract freeze + contract tests) → P0.3 (architecture design)
+  → P0.4 (skeleton) → P0.5 (scan API-first) → P0.6 (OpenShift API-first)
+  → P0.7 (expand + report CLI) → P0.8 (cleanup plan). Do not skip ahead.

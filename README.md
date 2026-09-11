@@ -12,13 +12,15 @@ Local pipeline that scans an **Azure Container Registry (ACR)** for image vulner
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| `az` | ≥ 2.60 | Azure CLI, logged in with reader access to the target ACR |
+| `az` | ≥ 2.60 | Azure CLI, logged in with reader access to the target ACR + Security Reader (tenant scope) so `microsoft.security/cvedetails` enrichment is visible |
 | `oc` | any | OpenShift CLI, logged in with `get pods` on target projects |
 | `jq` | ≥ 1.6 | JSON processing in shell scripts |
 | `bc` | any | CVSS score arithmetic in `defender.sh` |
-| Python | ≥ 3.11 | `expandcsv.py` and `report.py` |
+| `python3` | ≥ 3.9 | `defender.sh` (calls `enrich_cvedetails.py` for local merge — see below), `expandcsv.py`, `report.py`. Stdlib only — no pip installs needed. |
 
 Target runtime is Linux / WSL (bash 4+). macOS works for local dev if you install a newer bash (`brew install bash`).
+
+**File layout requirement:** `enrich_cvedetails.py` MUST be co-located with `defender.sh` (same directory). `defender.sh` invokes it via `$(dirname "$0")/enrich_cvedetails.py`. If missing, `defender.sh` aborts with a clear error in Phase 2d.
 
 ## Quickstart — full pipeline
 
@@ -40,9 +42,9 @@ Target runtime is Linux / WSL (bash 4+). macOS works for local dev if you instal
 
 # Fast mode — skip the tag_resolve phase (CI/CD, large scans, CVE counts only):
 ./defender.sh --acr-name <ACR_NAME> --min-score 9 --skip-tags
-#    → zero 'az repository show-tags' calls
+#    → zero 'az repository show-tags' calls (Phase 1 skipped entirely)
 #    → every CSV row has tag="N/A"
-#    → phase-2 latency drops to 0ms; downstream (report.py, expandcsv.py) is unchanged
+#    → downstream (report.py, expandcsv.py) is unchanged
 #    → incompatible with --scan-image (which resolves tag → digest up front)
 
 # 2. Cross-reference with running OpenShift workloads
@@ -61,6 +63,59 @@ python3 report.py
 ```
 
 Open `vulnerability_report.html` in a browser to view the executive summary.
+
+## Architecture — `defender.sh` scan phases (P2, 2026-09)
+
+Since 2026-09 the scanner uses a **two-phase batched** architecture (see
+`docs/mdvm-two-phase-benchmark.md` for the design rationale and empirical
+data). Full-ACR scans that used to run for hours now complete in tens of
+minutes.
+
+```
+PHASE 0 — enumerate    small ARG query, returns unique (repo, digest) pairs
+PHASE 1 — tag_resolve  one `az acr repository show-tags` per unique repo
+                       (skip entirely via --skip-tags)
+PHASE 2 — batched scan (report-only mode only):
+   2a. assessments in batches of ~50 digests (no cvedetails JOIN — cheap)
+   2b. extract unique CVE IDs from the assessments rows
+   2c. cvedetails in batches of ~500 CVE IDs (only enrichment fields)
+   2d. local merge via `enrich_cvedetails.py` → final 19-column CSV
+
+   Block/unblock modes stay on the legacy per-digest path (narrow scope).
+```
+
+Recovery: `_scan_batch_recursive` in `defender.sh` halves a batch on ARG
+`UnexpectedQueryExecutionError` and retries (100 → 50 → 25 → 10 → …). Every
+split logs a WARN; single-item failures abort with an ERROR. Never falls
+silently to 1-by-1.
+
+**CSV format contract is unchanged**: same 19 columns in the same order,
+same quoting semantics. `check_ocp.sh`, `expandcsv.py` and `report.py`
+consume the output identically to the pre-P2 shape.
+
+## Roadmap — Python API-first migration (in planning)
+
+A follow-up track (tasks P0.1–P0.8) will migrate the pipeline to a Python
+package (`defender_pipeline/`) that talks directly to Azure Resource
+Graph, ACR and Kubernetes SDKs — no `az`/`az rest`/`oc`/subprocess in
+the main path. Motivations: performance, testability, modularity,
+observability, and reduced dependency on the local CLI toolchain.
+
+Guardrails for the migration:
+
+- **`defender.sh` is NOT altered during the migration.** It stays as
+  the stable production baseline while the Python path is built in
+  parallel and validated.
+- CSV / HTML contracts (below) are frozen — the Python path must
+  produce byte-identical `vulnerable_images_report.csv` and equivalent
+  downstream artifacts (`resultado_cruzamento.csv`, `expanded.csv`,
+  `vulnerability_report.html`) before any deprecation.
+- Migration order enforces docs & contract freeze before code:
+  P0.1 (docs) → P0.2 (contracts) → P0.3 (architecture design)
+  → P0.4 (skeleton) → P0.5–P0.7 (implementation) → P0.8 (cleanup plan).
+
+See `docs/python-architecture.md` (created in P0.3) once available for
+the technical design.
 
 The HTML report is organized as two tabs — **Images** (Azure Container
 Registry data: one row per `repo:tag@digest`) and **Cluster** (OpenShift

@@ -73,11 +73,17 @@ These are the rules Copilot must follow when suggesting or making changes.
 
 ## 5. KQL
 
-- Do not change the KQL query in `defender.sh` without a clear technical
-  justification (a new Defender for Cloud schema field, a documented behavior
-  change, an on-call incident that traces to the query).
+- `defender.sh` builds KQL via helper functions, not a monolithic heredoc:
+  * `build_enumerate_digests_query` (Phase 0)
+  * `build_batched_assessments_query` (Phase 2a, no JOIN)
+  * `build_batched_cvedetails_query` (Phase 2c, enrichment only)
+  * `build_digest_scan_query` (legacy per-digest, used by block/unblock modes)
+- Do not change these functions without a clear technical justification
+  (a new Defender for Cloud schema field, a documented behavior change,
+  an on-call incident that traces to the query).
 - Any KQL change requires a smoke test in a controlled staging environment
-  before merging.
+  before merging. The 39 invariants in
+  `tests/test_defender_query_migration.py` must stay green.
 - The surrounding shell (parsing, retry, logging, error handling) can be
   modified freely — those changes still need to pass `make check`.
 
@@ -90,6 +96,11 @@ These are the rules Copilot must follow when suggesting or making changes.
   with `bash`, Python stdlib, `jq`, `az`, or `oc`.
 - If a dependency is added, document its purpose in the PR description and
   add it to `pyproject.toml`.
+- **`defender.sh` requires `python3 ≥ 3.9`** to invoke
+  `enrich_cvedetails.py` in Phase 2d (report-only mode). The helper must
+  be co-located (`$(dirname "$0")/enrich_cvedetails.py`). Uses stdlib
+  only — do not add pip dependencies to the helper unless P0.5+ track
+  changes that (and even then, keep the current script working).
 
 ## 7. Documentation
 
@@ -112,21 +123,32 @@ These are the rules Copilot must follow when suggesting or making changes.
 
 ## Performance / telemetry
 
-`defender.sh` emits a stable per-page timing line via `log_info`:
+`defender.sh` emits a per-phase timing log line via `log_info`
+(the pre-P2 per-page format is retired):
 
 ```
-page N batch=... total=... retries=... tag_api_calls=... timings_ms=graph_query:NNN tag_resolve:NNN rows:NNN total:NNN
+enumerate: found N unique pairs in M page(s) time_ms=X
+tag_resolve: end api_calls=A cached_pairs=B time_ms=X
+phase2a assessments_batched: end batches=B rows=R time_ms=X
+phase2c cvedetails_batched: end batches=B rows=R time_ms=X
+phase2d merge: enrich_cvedetails rows_read=X rows_emitted=Y rows_enriched=Z ...
+end total_processed=N digests=D pages=P report_file=...
 ```
 
-Field order and names are a public interface — dashboards, CI graphs and `scripts/benchmark-defender.sh` parse it. If you must change the layout, update `tests/test_defender_timing_log_format.py` and the benchmark script in the same PR.
+Field order and names are a public interface — dashboards, CI graphs and
+`scripts/benchmark-defender.sh` parse it. If you must change the layout,
+update `tests/test_defender_batched_integration.py` and any benchmark
+scripts in the same PR.
 
-For performance work, run the local benchmark first (no live Azure needed):
+For performance work, run local integration tests first (no live Azure
+needed):
 
 ```bash
-scripts/benchmark-defender.sh --pages 3 --rows-per-page 1000 --latency-ms 20
+pytest tests/test_defender_batched_integration.py -q
 ```
 
-Capture before/after numbers in the PR description. Never assert on absolute timing values in tests.
+Capture before/after numbers in the PR description. Never assert on
+absolute timing values in tests.
 
 ## Merge gate
 
@@ -142,13 +164,44 @@ contract — if it is not green, the change is not ready.
 
 ```
 ├── defender.sh            # ACR scan via Azure Resource Graph (KQL — see §5)
+├── enrich_cvedetails.py   # Python helper invoked by defender.sh in Phase 2d
 ├── check_ocp.sh           # OpenShift cross-reference; exits 3 on partial coverage (§3)
 ├── group_findings.py      # Aggregate flat CSV → one row per (workload, image)
 ├── expandcsv.py           # Expand grouped CSV → one row per CVE
 ├── report.py              # Render the single-file HTML report
 ├── tests/                 # pytest — unit, integration, E2E (all offline)
+├── docs/                  # Design + benchmark docs (mdvm-two-phase-benchmark.md, etc.)
 ├── Makefile               # test / lint / check / report / pipeline-local / smoke-real / clean
 ├── pyproject.toml         # pytest, ruff, pyright config
 ├── AGENTS.md              # Same rules for Claude Code / Cursor / Aider
 └── README.md              # Operator quickstart
 ```
+
+## 8. Python API-first migration (backlog: P0.1–P0.8)
+
+A follow-up track is planned to migrate the whole pipeline to a Python
+package `defender_pipeline/` that uses **Azure SDKs and Kubernetes
+Python client directly** — no `az`/`az rest`/`az acr`/`oc`/`subprocess`
+in the main path.
+
+### Rules when working on the migration
+
+- **Do NOT rewrite the new Python path as a `subprocess.run(["az", ...])`
+  wrapper.** Use `azure-identity`, `azure-mgmt-resourcegraph`,
+  `azure-containerregistry`, `kubernetes` (Python client) instead.
+  `subprocess` is only acceptable as a **temporary, explicitly-justified
+  fallback** — never as the architecture.
+- **Do NOT alter `defender.sh`, `enrich_cvedetails.py`, `check_ocp.sh`,
+  `expandcsv.py` or `report.py` during the migration.** They stay as
+  the stable production baseline. The Python path lives in a separate
+  package (`defender_pipeline/`) and is validated in parallel.
+- **CSV contracts are frozen** by task P0.2. `vulnerable_images_report.csv`
+  (19 cols), `resultado_cruzamento.csv` (24 cols), `expanded.csv`
+  (22 cols) and `vulnerability_report.html` must stay byte-identical /
+  semantically equivalent until an approved deprecation plan (P0.8)
+  says otherwise. The Python path must diff clean against the bash
+  outputs before any cutover.
+- **Order of work is enforced by task blocking**: P0.1 (docs) → P0.2
+  (contract freeze + tests) → P0.3 (design) → P0.4 (skeleton) →
+  P0.5 (scan API-first) → P0.6 (OpenShift API-first) →
+  P0.7 (expand + report CLI) → P0.8 (cleanup plan). Do not skip ahead.
