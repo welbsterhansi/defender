@@ -278,7 +278,11 @@ class TestDefenderCriticalEvents:
         )
         content = next((tmp_path / "logs").glob("run-*.log")).read_text(encoding="utf-8")
         assert re.search(r"INFO\s+start acr=myacr mode=report-only", content)
-        assert re.search(r"INFO\s+end total_processed=0 pages=1 report_file=", content)
+        # Post-P2 the end-line uses digests=<n> (per (repo, digest) pair count);
+        # empty enumerate result yields digests=0.
+        assert re.search(
+            r"INFO\s+end total_processed=0 digests=0 report_file=", content,
+        )
 
     def test_defender_exit_trap_not_broken_by_logging(self, tmp_path: Path) -> None:
         """No leftover *.csv.tmp.* files means the EXIT trap ran cleanly.

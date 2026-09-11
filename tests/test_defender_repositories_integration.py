@@ -62,9 +62,13 @@ if [ "$1 $2 $3" = "acr manifest list-metadata" ]; then
     exit 0
 fi
 
-# `az graph query ...` — capture the -q value (query string, not a path).
-# defender.sh invokes `az graph query -q "$(cat "$QUERY_FILE")"` so `-q`
-# receives the KQL text directly.
+# `az account show` — auth sanity check
+if [ "$1 $2" = "account show" ]; then
+    echo '{{"user":{{"name":"t@t"}},"tenantId":"tid"}}'
+    exit 0
+fi
+
+# `az graph query ...` (legacy) — capture the -q value (query string).
 if [ "$1 $2" = "graph query" ]; then
     qval=""
     while [ $# -gt 0 ]; do
@@ -77,6 +81,21 @@ if [ "$1 $2" = "graph query" ]; then
         printf '%s\\n' "$qval" >> "$CAPTURE_TO"
     fi
     echo '{{"data":[],"skip_token":""}}'
+    exit 0
+fi
+
+# `az rest --method post --url .../resource-graph/... --body '{{"query":"..."}}'`
+# (P2 refactor). Capture the query out of the body via jq.
+if [ "$1" = "rest" ]; then
+    body=""
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--body" ]; then body="$2"; break; fi
+        shift
+    done
+    if [ -n "${{body:-}}" ] && [ -n "${{CAPTURE_TO:-}}" ]; then
+        printf '%s' "$body" | jq -r '.query // ""' >> "$CAPTURE_TO"
+    fi
+    echo '{{"data":[]}}'
     exit 0
 fi
 exit 0
@@ -204,21 +223,29 @@ class TestRepositoriesValidation:
 
 
 # ---------------------------------------------------------------------------
-# KQL injection — exact-match `in (...)` on Leg A + anchored contains on Leg B
+# KQL injection — anchored `contains "repositories-<dashed>-images-"` filter
+# on the single (post-migration) query.
+#
+# Historical note: pre-2026-07-31 there was a "Leg A" (subassessments +
+# `artifactDetails.repositoryName in (...)`) alongside "Leg B" (assessments +
+# `resourceDetails.Id contains "repositories-…-images-"`). Microsoft retired
+# subassessments so Leg A is gone. Only the Leg-B-style filter remains, and
+# we assert Leg A's filter form does NOT leak back in.
 # ---------------------------------------------------------------------------
 
 class TestKqlFilterInjection:
-    def test_leg_a_uses_in_list_literal(self, tmp_path: Path) -> None:
+    def test_leg_a_filter_shape_gone_post_migration(self, tmp_path: Path) -> None:
+        """Leg A used `artifactDetails.repositoryName in (...)` which would
+        target the retired subassessments type — must not appear anymore."""
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
             "--repositories", "app-backend,payments-api",
         ], capture_query=True)
         assert r.returncode == 0, r.stderr
         kql = r.captured_query   # type: ignore[attr-defined]
-        # Leg A: exact match with `in (...)`. NOT `contains`.
-        assert 'artifactDetails.repositoryName in ("app-backend", "payments-api")' in kql
-        # Old contains-form must NOT appear on repositoryName.
-        assert 'artifactDetails.repositoryName contains' not in kql
+        assert "artifactDetails.repositoryName in (" not in kql
+        assert "artifactDetails.repositoryName contains" not in kql
+        assert "subassessments" not in kql.lower()
 
     def test_leg_b_uses_anchored_contains(self, tmp_path: Path) -> None:
         r = _run_defender(tmp_path, [
@@ -241,6 +268,9 @@ class TestKqlFilterInjection:
         bin_dir.mkdir(parents=True, exist_ok=True)
         az_body = """#!/usr/bin/env bash
 export CAPTURE_TO="%s"
+if [ "$1 $2" = "account show" ]; then
+    echo '{"user":{"name":"t"},"tenantId":"tid"}'; exit 0
+fi
 if [ "$1 $2" = "acr show" ]; then exit 0; fi
 if [ "$1 $2 $3" = "acr repository list" ]; then
     printf 'team/app\\napp-backend\\n'
@@ -258,6 +288,16 @@ if [ "$1 $2" = "graph query" ]; then
     echo '{"data":[],"skip_token":""}'
     exit 0
 fi
+if [ "$1" = "rest" ]; then
+    body=""
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--body" ]; then body="$2"; break; fi
+        shift
+    done
+    [ -n "$body" ] && printf '%%s' "$body" | jq -r '.query // ""' >> "$CAPTURE_TO"
+    echo '{"data":[]}'
+    exit 0
+fi
 exit 0
 """ % (tmp_path / "captured_query.kql")
         az_path = bin_dir / "az"
@@ -271,16 +311,22 @@ exit 0
         )
         assert result.returncode == 0, result.stderr
         kql = (tmp_path / "captured_query.kql").read_text(encoding="utf-8")
-        # Leg A: exact `in ("team/app")` — slashes preserved as-is.
-        assert 'artifactDetails.repositoryName in ("team/app")' in kql
+        # Leg A's `in ("team/app")` form must not leak back in (subassessments retired).
+        assert 'artifactDetails.repositoryName in ("team/app")' not in kql
         # Leg B: dashed anchor.
         assert 'resourceDetails.Id contains "repositories-team-app-images-"' in kql
 
     def test_no_kql_injection_when_flag_absent(self, tmp_path: Path) -> None:
+        """Without --repositories / --repository, the KQL must not carry any
+        `resourceDetails.Id contains "repositories-<x>-images-"` filter. The
+        literal `repositories-` may still appear inside the hardcoded
+        `extract(@"repositories-(.+)-images-…")` regex — that's the KQL
+        pattern, not injected data — so we assert on the operator-controlled
+        filter form specifically."""
         r = _run_defender(tmp_path, [
             "--acr-name", "myacr",
         ], capture_query=True)
         assert r.returncode == 0
         kql = r.captured_query   # type: ignore[attr-defined]
         assert 'artifactDetails.repositoryName in (' not in kql
-        assert 'repositories-' not in kql.split("| union")[0]  # Leg A only
+        assert 'resourceDetails.Id contains "repositories-' not in kql
