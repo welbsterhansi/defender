@@ -4,6 +4,32 @@ version = "0.1.0"
 description = "Defender for Cloud ACR scan + OpenShift cross-reference + HTML report"
 requires-python = ">=3.11"
 
+# Optional deps for the new Python API-first pipeline (task P0.4+).
+# Not required to run the existing bash pipeline. Install with:
+#   pip install -e .[pipeline]
+#
+# See docs/python-architecture.md §2 for rationale on each choice.
+[project.optional-dependencies]
+pipeline = [
+    "azure-identity>=1.15,<2.0",             # DefaultAzureCredential chain
+    "azure-mgmt-resourcegraph>=8.0,<9.0",    # ARG queries (api 2022-10-01)
+    "azure-containerregistry>=1.2,<2.0",     # ACR tags/manifests
+    "kubernetes>=29.0,<32.0",                # OpenShift correlation
+    "tenacity>=8.2,<10.0",                   # batch-split retry
+]
+
+# `defender_pipeline` is importable as a package once installed. The scripts
+# are still runnable via `python3 -m defender_pipeline` without install.
+[project.scripts]
+defender-pipeline = "defender_pipeline.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.20"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["defender_pipeline"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
@@ -20,7 +46,7 @@ ignore = ["E501"]
 allowed-confusables = ["–", "—", "−", "≥", "•", "…", "→", "×", "×"]
 
 [tool.pyright]
-include = ["expandcsv.py", "report.py", "group_findings.py", "tests"]
+include = ["expandcsv.py", "report.py", "group_findings.py", "enrich_cvedetails.py", "defender_pipeline", "tests"]
 extraPaths = ["."]
 pythonVersion = "3.11"
 reportMissingImports = "error"
