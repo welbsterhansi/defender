@@ -341,17 +341,17 @@ securityresources
 | mv-expand cve = _cves
 | extend cveId = coalesce(tostring(cve.CveId), tostring(cve.cveId))
 | where isnotempty(cveId)
+| extend cveIdJoin = toupper(cveId)
 | join kind=leftouter (
     securityresources
     | where type =~ "microsoft.security/cvedetails"
     | where tostring(properties.status) !~ "Reject"
-    | extend _cveIdJoin = coalesce(tostring(properties.cveId), tostring(name))
-    | where isnotempty(_cveIdJoin)
+    | extend cveIdJoin = toupper(coalesce(tostring(properties.cveId), tostring(name)))
+    | where isnotempty(cveIdJoin)
     | extend _cvss40 = todouble(properties.cvss["4.0"].base)
-    | extend _cvss31 = todouble(properties.cvss["3.1"].base)
     | extend _cvss30 = todouble(properties.cvss["3.0"].base)
     | extend _cvss20 = todouble(properties.cvss["2.0"].base)
-    | extend _cvssEnrich = coalesce(_cvss40, _cvss31, _cvss30, _cvss20)
+    | extend _cvssEnrich = coalesce(_cvss40, _cvss30, _cvss20)
     | extend _publishedDateEnrich = todatetime(properties.publishedDate)
     | extend _severityEnrich = tostring(properties.severity)
     | extend _verifiedExpEnrich = iff(isnull(properties.exploitabilityDetails.IsVerified), false, tobool(properties.exploitabilityDetails.IsVerified))
@@ -364,9 +364,9 @@ securityresources
         _verifiedExpEnrich = max(toint(_verifiedExpEnrich)),
         _publishedExpEnrich = max(toint(_publishedExpEnrich)),
         _inExploitKitEnrich = max(toint(_inExploitKitEnrich))
-      by cveId = _cveIdJoin
-  ) on cveId
-| project-away cveId1
+      by cveIdJoin
+  ) on cveIdJoin
+| project-away cveIdJoin1
 | extend
     repository = tostring(_image.RepositoryDetails.RepositoryName),
     digest     = _digest,
@@ -425,13 +425,33 @@ securityresources
         )
     ),
     cveAgeDays = iff(
-        isnotnull(_publishedDateEnrich),
-        datetime_diff('day', now(), _publishedDateEnrich),
+        isnotnull(coalesce(_publishedDateEnrich, todatetime(cve.PublishedDate))),
+        datetime_diff('day', now(), coalesce(_publishedDateEnrich, todatetime(cve.PublishedDate))),
         long(-1)
     ),
-    isInExploitKit      = iff(tobool(_inExploitKitEnrich) == true, "true", "false"),
-    hasPublishedExploit = iff(tobool(_publishedExpEnrich) == true, "true", "false"),
-    hasVerifiedExploit  = iff(tobool(_verifiedExpEnrich)  == true, "true", "false")
+    isInExploitKit = iff(
+        tobool(coalesce(
+            _inExploitKitEnrich,
+            cve.ExploitabilityDetails.IsInExploitKit
+        )) == true,
+        "true", "false"
+    ),
+    hasPublishedExploit = iff(
+        tobool(coalesce(
+            _publishedExpEnrich,
+            cve.ExploitabilityDetails.ExploitStepsPublished,
+            cve.ExploitabilityDetails.IsPubliclyDisclosed
+        )) == true,
+        "true", "false"
+    ),
+    hasVerifiedExploit = iff(
+        tobool(coalesce(
+            _verifiedExpEnrich,
+            cve.ExploitabilityDetails.ExploitStepsVerified,
+            cve.ExploitabilityDetails.IsVerified
+        )) == true,
+        "true", "false"
+    )
 | extend patchable = case(
     fixStatus =~ "FixAvailable", "true",
     fixStatus in~ ("NoFix", "NoFixAvailable", "WillNotFix"), "false",
