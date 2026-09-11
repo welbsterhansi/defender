@@ -50,14 +50,25 @@ def defender_source() -> str:
 
 @pytest.fixture(scope="module")
 def kql(defender_source: str) -> str:
-    """Extract the KQL heredoc that defender.sh writes to $QUERY_FILE."""
-    match = re.search(
-        r'cat\s*>\s*"?\$QUERY_FILE"?\s*<<-?\s*(\w+)\s*\n(.*?)\n\s*\1\b',
-        defender_source,
-        re.DOTALL,
+    """Extract the KQL heredoc emitted by build_digest_scan_query().
+
+    Post-refactor (2026-09) the KQL is no longer a single monolithic heredoc
+    written to $QUERY_FILE — it is built dynamically per digest by the
+    `build_digest_scan_query()` bash function. The heredoc lives inside that
+    function's body; we grab it so the guardrail assertions below still work.
+    """
+    func_start = re.search(
+        r'build_digest_scan_query\s*\(\s*\)\s*\{', defender_source,
     )
-    assert match, "could not find $QUERY_FILE heredoc in defender.sh"
-    return match.group(2)
+    assert func_start, (
+        "build_digest_scan_query() function not found in defender.sh"
+    )
+    tail = defender_source[func_start.end():]
+    heredoc = re.search(
+        r'cat\s*<<-?\s*(\w+)\s*\n(.*?)\n\s*\1\b', tail, re.DOTALL,
+    )
+    assert heredoc, "no cat<<HEREDOC found inside build_digest_scan_query()"
+    return heredoc.group(2)
 
 
 def _coalesce_blocks(kql: str) -> list[str]:
@@ -104,13 +115,21 @@ class TestSubassessmentsGone:
     def test_kql_has_no_legacy_c0b7cfc6_filter(self, kql: str) -> None:
         assert "c0b7cfc6-3172-465a-b378-53c7ff2cc0d5" not in kql
 
-    def test_debug_block_does_not_query_subassessments(
+    def test_no_query_targets_subassessments(
         self, defender_source: str,
     ) -> None:
-        for match in re.finditer(r"az\s+graph\s+query[^\n]*", defender_source):
-            assert "subassessments" not in match.group(0).lower(), (
-                f"an `az graph query` still targets subassessments:\n  {match.group(0)}"
-            )
+        """Neither the retired `az graph query` (kept via git blame in case of
+        rollback) nor the current `az rest` transport may target the retired
+        subassessments type."""
+        for pattern in (r"az\s+graph\s+query[^\n]*", r"az\s+rest[^\n]*"):
+            for match in re.finditer(pattern, defender_source):
+                assert "subassessments" not in match.group(0).lower(), (
+                    f"az call still targets subassessments:\n  {match.group(0)}"
+                )
+        # Also guard against subassessments references in the KQL builders.
+        assert "subassessments" not in defender_source.lower(), (
+            "Leg A (subassessments) is retired — remove all references"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -168,11 +187,17 @@ class TestCvedetailsJoinPresent:
         # CVE ids differ in casing between assessments (uppercase, CVE-XXXX)
         # and cvedetails.name (lowercase, cve-xxxx). Join must upper() both
         # sides to avoid silently missing every enrichment match.
-        assert re.search(r"toupper\s*\(\s*tostring\s*\(\s*properties\.cveId",
-                         kql), (
-            "cvedetails-side join key must upper() properties.cveId"
+        # Accept either the "toupper wraps the outer coalesce" shape or the
+        # "toupper wraps just the property read" shape — both normalize case.
+        cvedetails_side = re.search(
+            r"toupper\s*\([^)]*properties\.cveId", kql,
         )
-        assert re.search(r"toupper\s*\(\s*cveId\s*\)", kql), (
+        assert cvedetails_side, (
+            "cvedetails-side join key must upper() properties.cveId "
+            "(directly or via a coalesce)"
+        )
+        assessments_side = re.search(r"toupper\s*\(\s*cveId\s*\)", kql)
+        assert assessments_side, (
             "assessments-side join key must upper() cveId"
         )
 
@@ -328,10 +353,13 @@ class TestFieldSources:
         )
 
     def test_current_version_from_scanner_mdvm(self, kql: str) -> None:
+        # currentVersion must come from _scanner.mdvm.DetectedSoftwareVersions.
+        # Accept either the single-value shape (`[0]`) or the multi-value
+        # shape (`array_length(...)` + `strcat_array(...)` joining all
+        # detected versions with a separator).
         assert re.search(
-            r"mdvm\.DetectedSoftwareVersions\s*\[\s*0\s*\]",
-            kql,
-        )
+            r"mdvm\.DetectedSoftwareVersions", kql,
+        ), "currentVersion must read _scanner.mdvm.DetectedSoftwareVersions"
 
     def test_repository_from_repository_details(self, kql: str) -> None:
         assert re.search(r"RepositoryDetails\.RepositoryName", kql)
@@ -400,7 +428,12 @@ class TestCsvColumnOrderPreserved:
     ]
 
     def test_project_column_list_matches(self, kql: str) -> None:
-        projects = re.findall(r"\|\s*project\s+([^\n|]+)", kql)
+        # `| project` may span multiple lines. Capture everything from
+        # `| project` up to the next pipe (which starts the next clause,
+        # e.g. `| distinct` or `| order by`).
+        projects = re.findall(
+            r"\|\s*project\s+(.+?)(?=\n\s*\||\Z)", kql, re.DOTALL,
+        )
         assert projects, "no `| project` clause found"
         top_level = [
             p for p in projects
@@ -410,7 +443,9 @@ class TestCsvColumnOrderPreserved:
             f"expected exactly 1 top-level `| project` (18-column CSV), "
             f"got {len(top_level)}"
         )
-        cols = [c.strip() for c in top_level[0].split(",")]
+        # Normalize whitespace/newlines and split into ordered column list.
+        collapsed = " ".join(top_level[0].split())
+        cols = [c.strip() for c in collapsed.split(",")]
         assert cols == self.EXPECTED_PROJECT_COLUMNS, (
             f"CSV column order is a downstream contract.\n"
             f"expected: {self.EXPECTED_PROJECT_COLUMNS}\n"
