@@ -473,6 +473,221 @@ securityresources
 KQL
 }
 
+# ---------------------------------------------------------------------------
+# Batched KQL builders (P2 — 2026-09).
+#
+# Motivation (see docs/mdvm-two-phase-benchmark.md + task #6):
+# The per-digest scan with inline `join` against `cvedetails` pays a ~4-5s
+# fixed cost per digest — the ARG engine touches the cvedetails table on
+# every call, regardless of how many rows the assessments side returns.
+# Empirical: 9389 digests → ~16h serial.
+#
+# Split the load into two batched queries + local merge in Python:
+#   * Query A — assessments in batches of digests, NO join. Emits per-CVE
+#     rows with 14 base fields + 6 inline fallback fields.
+#   * Query B — cvedetails in batches of unique CVE IDs. Emits enrichment
+#     per CVE (cvssScore, severity, publishedDate, exploit flags).
+#   * enrich_cvedetails.py merges by toupper(cveId) locally and emits the
+#     final CSV with the 19-column contract.
+# ---------------------------------------------------------------------------
+
+# Build a KQL `in (...)` list expression from bash args. Elements are
+# safely quoted (each becomes "value" inside the KQL). Empty args → empty
+# list which caller must guard against.
+_kql_string_list() {
+    local sep="" out=""
+    local item
+    for item in "$@"; do
+        # Reject quotes / backslashes to avoid KQL injection. The pipeline
+        # only ever passes digest hashes (hex) and CVE IDs (CVE-NNNN-…),
+        # so this is defensive.
+        case "$item" in
+            *\"*|*\\*) log_warn "skipping suspicious KQL list item: $item"; continue ;;
+        esac
+        out+="${sep}\"${item}\""
+        sep=", "
+    done
+    printf '%s' "$out"
+}
+
+# Query A — assessments in batch. Emits per-CVE rows without any JOIN.
+# The 6 `inline*` fields are the fallbacks for when cvedetails can't
+# enrich a given CVE (identity without MG scope, rejected CVE, etc).
+build_batched_assessments_query() {
+    local digest_list; digest_list=$(_kql_string_list "$@")
+    cat <<KQL
+securityresources
+| where type == "microsoft.security/assessments"
+| where properties.metadata.recommendationCategory == "SoftwareUpdate"
+| where properties.resourceDetails.ResourceType == ".containerimage"
+| where properties.resourceDetails.Source == "Azure"
+| extend
+    _scanner = parse_json(tostring(properties.additionalData.ScannersDetails)),
+    _image   = parse_json(tostring(properties.resourceAdditionalData)),
+    _cves    = parse_json(tostring(properties.additionalData.CvesDetails))
+| extend _digest = tostring(_image.Digest)
+| where _digest in ($digest_list)
+| mv-expand cve = _cves
+| extend cveId = coalesce(tostring(cve.CveId), tostring(cve.cveId))
+| where isnotempty(cveId) and cveId startswith "CVE-"
+| project
+    repository = tostring(_image.RepositoryDetails.RepositoryName),
+    digest = _digest,
+    cveId,
+    packageName = tostring(coalesce(
+        properties.additionalData.SoftwareName,
+        properties.additionalData.softwareName
+    )),
+    currentVersion = case(
+        array_length(_scanner.mdvm.DetectedSoftwareVersions) > 0,
+            strcat_array(_scanner.mdvm.DetectedSoftwareVersions, ", "),
+        array_length(_scanner.agentlessmdvm.DetectedSoftwareVersions) > 0,
+            strcat_array(_scanner.agentlessmdvm.DetectedSoftwareVersions, ", "),
+        tostring(properties.additionalData.DetectedSoftwareVersions)
+    ),
+    fixedVersion = tostring(coalesce(
+        _scanner.mdvm.FixedVersion,
+        _scanner.agentlessmdvm.FixedVersion,
+        properties.additionalData.FixedVersion,
+        cve.FixedVersion,
+        cve.fixedVersion
+    )),
+    fixStatus = tostring(coalesce(
+        cve.FixStatus,
+        cve.fixStatus,
+        properties.additionalData.FixStatus,
+        _scanner.mdvm.FixStatus
+    )),
+    packageCategory = tostring(coalesce(
+        properties.additionalData.PackageType,
+        _scanner.mdvm.category,
+        _scanner.mdvm.PackageType
+    )),
+    packageLanguage = tostring(coalesce(
+        properties.additionalData.Language,
+        _scanner.mdvm.Language
+    )),
+    remediation = tostring(coalesce(
+        cve.Description,
+        properties.remediation,
+        properties.description
+    )),
+    lastPushedToRegistryUTC = tostring(coalesce(
+        _image.LastPushedToRegistryUTC,
+        _image.RepositoryDetails.LastPushedToRegistryUTC
+    )),
+    inlineSeverity = tostring(cve.Severity),
+    inlineCvssBase = todouble(cve.Cvss[0].Value.Base),
+    inlinePublishedDate = tostring(cve.PublishedDate),
+    inlineInExploitKit = tostring(cve.ExploitabilityDetails.IsInExploitKit),
+    inlinePubliclyDisclosed = tostring(coalesce(
+        cve.ExploitabilityDetails.ExploitStepsPublished,
+        cve.ExploitabilityDetails.IsPubliclyDisclosed
+    )),
+    inlineVerified = tostring(coalesce(
+        cve.ExploitabilityDetails.ExploitStepsVerified,
+        cve.ExploitabilityDetails.IsVerified
+    ))
+| distinct
+    repository, digest, cveId, packageName, currentVersion, fixedVersion,
+    fixStatus, packageCategory, packageLanguage, remediation, lastPushedToRegistryUTC,
+    inlineSeverity, inlineCvssBase, inlinePublishedDate,
+    inlineInExploitKit, inlinePubliclyDisclosed, inlineVerified
+KQL
+}
+
+# Query B — cvedetails enrichment for a batch of CVE IDs. `cveIdJoin` is
+# always upper-cased so Python can do a case-insensitive dict lookup.
+build_batched_cvedetails_query() {
+    local cveid_list; cveid_list=$(_kql_string_list "$@")
+    cat <<KQL
+securityresources
+| where type =~ "microsoft.security/cvedetails"
+| where tostring(properties.status) !~ "Reject"
+| extend cveIdJoin = toupper(coalesce(tostring(properties.cveId), tostring(name)))
+| where cveIdJoin in ($cveid_list)
+| extend _cvss40 = todouble(properties.cvss["4.0"].base)
+| extend _cvss30 = todouble(properties.cvss["3.0"].base)
+| extend _cvss20 = todouble(properties.cvss["2.0"].base)
+| extend cvssEnrich = coalesce(_cvss40, _cvss30, _cvss20)
+| extend publishedDateEnrich = tostring(properties.publishedDate)
+| extend severityEnrich = tostring(properties.severity)
+| extend verifiedExpEnrich = iff(isnull(properties.exploitabilityDetails.IsVerified), false, tobool(properties.exploitabilityDetails.IsVerified))
+| extend publishedExpEnrich = iff(isnull(properties.exploitabilityDetails.IsPubliclyDisclosed), false, tobool(properties.exploitabilityDetails.IsPubliclyDisclosed))
+| extend inExploitKitEnrich = iff(isnull(properties.exploitabilityDetails.IsInExploitKit), false, tobool(properties.exploitabilityDetails.IsInExploitKit))
+| summarize
+    cvssEnrich = max(cvssEnrich),
+    publishedDateEnrich = take_any(publishedDateEnrich),
+    severityEnrich = take_any(severityEnrich),
+    verifiedExpEnrich = max(toint(verifiedExpEnrich)),
+    publishedExpEnrich = max(toint(publishedExpEnrich)),
+    inExploitKitEnrich = max(toint(inExploitKitEnrich))
+  by cveIdJoin
+| project cveIdJoin, cvssEnrich, publishedDateEnrich, severityEnrich,
+          verifiedExpEnrich, publishedExpEnrich, inExploitKitEnrich
+KQL
+}
+
+# ---------------------------------------------------------------------------
+# Batched scan helpers with skip-token pagination + failure fallback.
+#
+# scan_assessments_batch and scan_cvedetails_batch:
+#   * Run their query with inner skip-token pagination.
+#   * Append raw `.data[]` rows (one per line, JSONL) to a caller-supplied
+#     output file.
+#   * On failure (any 3-retry exhaustion in run_arg_rest_query), split the
+#     batch in half and recurse. If a single-item batch fails, abort with
+#     a clear error — a single-CVE-or-digest query should never fail;
+#     something structural is wrong.
+#   * Return 0 on success, non-zero on unrecoverable failure.
+# ---------------------------------------------------------------------------
+
+_scan_run_paginated() {
+    local query="$1"
+    local out_file="$2"
+    local skip_token=""
+
+    while : ; do
+        if ! run_arg_rest_query "$query" "$skip_token"; then
+            return 1
+        fi
+        local n; n=$(printf '%s' "$LAST_QUERY_RESPONSE" | jq '.data | length' 2>/dev/null || echo 0)
+        if [ "$n" -gt 0 ]; then
+            printf '%s' "$LAST_QUERY_RESPONSE" | jq -c '.data[]' >> "$out_file"
+        fi
+        skip_token="$LAST_QUERY_SKIP_TOKEN"
+        [ -z "$skip_token" ] && break
+    done
+    return 0
+}
+
+# Recursively scan a batch of items. Splits on failure.
+#   $1 = builder function name (build_batched_assessments_query or build_batched_cvedetails_query)
+#   $2 = output JSONL file path
+#   $3..N = items (digests or CVE IDs)
+_scan_batch_recursive() {
+    local builder="$1"; shift
+    local out_file="$1"; shift
+    local n=$#
+    [ "$n" -eq 0 ] && return 0
+
+    local query; query=$("$builder" "$@")
+    if _scan_run_paginated "$query" "$out_file"; then
+        return 0
+    fi
+
+    if [ "$n" -eq 1 ]; then
+        log_error "single-item batch failed after retries: ${1}"
+        return 1
+    fi
+
+    local half=$(( n / 2 ))
+    log_warn "batch of $n items failed via ${builder}; splitting to $half + $(( n - half ))"
+    _scan_batch_recursive "$builder" "$out_file" "${@:1:$half}" || return 1
+    _scan_batch_recursive "$builder" "$out_file" "${@:$((half + 1))}" || return 1
+    return 0
+}
+
 # Function to display usage
 usage() {
     echo "Usage: $0 --acr-name <ACR_NAME> [--min-score <SCORE>] [--max-score <SCORE>] [--repository <REPOSITORY>] [--dry-run] [--block-images] [--unblock]"
@@ -1327,7 +1542,137 @@ JQ_ROW_EXTRACT='
     ] | join("")
 '
 
-for pair in "${DIGEST_PAIRS[@]}"; do
+# ═════════════════════════════════════════════════════════════════════════
+# PHASE 2 — Path selection: batched (report-only) or per-digest (block/unblock)
+#
+# * REPORT-ONLY (default, dominant scan-large-ACR case):
+#     Uses the two-phase batched path (task #6, docs/mdvm-two-phase-benchmark).
+#     Query A (assessments in batches of digests, no JOIN) + Query B
+#     (cvedetails in batches of unique CVE IDs) + local merge in Python.
+#     Aim: ~30-40x fewer ARG calls than the per-digest path.
+#
+# * BLOCK / UNBLOCK modes:
+#     Kept on the legacy per-digest path — these operations are inherently
+#     narrow-scope (nobody blocks 9k+ images at once), so the per-digest
+#     cost is acceptable and the tighter feedback loop is preferable.
+# ═════════════════════════════════════════════════════════════════════════
+
+if [ "$BLOCK_IMAGES" = false ] && [ "$UNBLOCK" = false ]; then
+    # ───── Batched report-only path ─────────────────────────────────────
+    ASSESSMENTS_BATCH_SIZE=50
+    CVEDETAILS_BATCH_SIZE=500
+
+    BATCHED_TMP_DIR=$(mktemp -d)
+    # Extend trap to clean the batched workspace on exit.
+    trap 'rm -rf "$BATCHED_TMP_DIR"; rm -f ${REPORT_TMP:+"$REPORT_TMP"}' EXIT
+
+    ASSESSMENTS_JSONL="${BATCHED_TMP_DIR}/assessments.jsonl"
+    CVEDETAILS_JSONL="${BATCHED_TMP_DIR}/cvedetails.jsonl"
+    TAG_CACHE_TSV="${BATCHED_TMP_DIR}/tags.tsv"
+    : > "$ASSESSMENTS_JSONL"
+    : > "$CVEDETAILS_JSONL"
+    : > "$TAG_CACHE_TSV"
+
+    # Dump the tag cache once so Python can do the lookup.
+    if [ "${#TAG_CACHE[@]}" -gt 0 ]; then
+        for _k in "${!TAG_CACHE[@]}"; do
+            printf '%s\t%s\n' "$_k" "${TAG_CACHE[$_k]}"
+        done > "$TAG_CACHE_TSV"
+    fi
+
+    # ── Phase 2a: batched assessments (no JOIN, cheap) ──────────────────
+    _t_phase2a_start=$(_now_realtime)
+    log_info "phase2a assessments_batched: start batch_size=${ASSESSMENTS_BATCH_SIZE} pairs=${TOTAL_DIGESTS}"
+    _assessments_batches=0
+    _batch_start=0
+    while [ "$_batch_start" -lt "$TOTAL_DIGESTS" ]; do
+        _batch_slice=("${DIGEST_PAIRS[@]:$_batch_start:$ASSESSMENTS_BATCH_SIZE}")
+        _digest_args=()
+        for _pair in "${_batch_slice[@]}"; do
+            _digest_args+=("${_pair##*|}")
+        done
+        _assessments_batches=$((_assessments_batches + 1))
+        _batch_end=$(( _batch_start + ${#_batch_slice[@]} ))
+        echo "[assessments batch ${_assessments_batches}] digests ${_batch_start}..${_batch_end} of ${TOTAL_DIGESTS}"
+        if ! _scan_batch_recursive build_batched_assessments_query \
+                "$ASSESSMENTS_JSONL" "${_digest_args[@]}"; then
+            log_error "assessments batch failed unrecoverably around index ${_batch_start}; aborting"
+            exit 2
+        fi
+        _batch_start=$_batch_end
+    done
+    _t_phase2a_ms=$(_elapsed_ms "$_t_phase2a_start")
+    _assessments_rows=$(wc -l < "$ASSESSMENTS_JSONL" | tr -d ' ')
+    log_info "phase2a assessments_batched: end batches=${_assessments_batches} rows=${_assessments_rows} time_ms=${_t_phase2a_ms}"
+    echo "Assessments: ${_assessments_rows} row(s) across ${_assessments_batches} batch(es), ${_t_phase2a_ms}ms"
+
+    # ── Phase 2b: extract unique CVE IDs (uppercase) ────────────────────
+    _t_phase2b_start=$(_now_realtime)
+    UNIQUE_CVES_FILE="${BATCHED_TMP_DIR}/unique_cves.txt"
+    jq -r 'select(.cveId != null) | .cveId | ascii_upcase' \
+        "$ASSESSMENTS_JSONL" 2>/dev/null | sort -u > "$UNIQUE_CVES_FILE" || true
+    _unique_cves=$(wc -l < "$UNIQUE_CVES_FILE" | tr -d ' ')
+    _t_phase2b_ms=$(_elapsed_ms "$_t_phase2b_start")
+    log_info "phase2b extract_cves: unique_cves=${_unique_cves} time_ms=${_t_phase2b_ms}"
+    echo "Unique CVEs: ${_unique_cves}"
+
+    # ── Phase 2c: batched cvedetails enrichment ─────────────────────────
+    _t_phase2c_start=$(_now_realtime)
+    _cvedetails_batches=0
+    if [ "$_unique_cves" -gt 0 ]; then
+        log_info "phase2c cvedetails_batched: start batch_size=${CVEDETAILS_BATCH_SIZE}"
+        mapfile -t _all_cves < "$UNIQUE_CVES_FILE"
+        _batch_start=0
+        while [ "$_batch_start" -lt "$_unique_cves" ]; do
+            _cve_slice=("${_all_cves[@]:$_batch_start:$CVEDETAILS_BATCH_SIZE}")
+            _cvedetails_batches=$((_cvedetails_batches + 1))
+            _batch_end=$(( _batch_start + ${#_cve_slice[@]} ))
+            echo "[cvedetails batch ${_cvedetails_batches}] CVE IDs ${_batch_start}..${_batch_end} of ${_unique_cves}"
+            if ! _scan_batch_recursive build_batched_cvedetails_query \
+                    "$CVEDETAILS_JSONL" "${_cve_slice[@]}"; then
+                log_error "cvedetails batch failed unrecoverably around index ${_batch_start}; aborting"
+                exit 2
+            fi
+            _batch_start=$_batch_end
+        done
+    fi
+    _t_phase2c_ms=$(_elapsed_ms "$_t_phase2c_start")
+    _cvedetails_rows=$(wc -l < "$CVEDETAILS_JSONL" | tr -d ' ')
+    log_info "phase2c cvedetails_batched: end batches=${_cvedetails_batches} rows=${_cvedetails_rows} time_ms=${_t_phase2c_ms}"
+    echo "Cvedetails: ${_cvedetails_rows} enrichment row(s) across ${_cvedetails_batches} batch(es), ${_t_phase2c_ms}ms"
+
+    # ── Phase 2d: local merge (Python) → final CSV ──────────────────────
+    _t_phase2d_start=$(_now_realtime)
+    ENRICH_HELPER="$(dirname "$0")/enrich_cvedetails.py"
+    if [ ! -f "$ENRICH_HELPER" ]; then
+        log_error "enrich_cvedetails.py not found at ${ENRICH_HELPER}; aborting"
+        exit 2
+    fi
+    _enrich_stderr=$(mktemp)
+    if ! python3 "$ENRICH_HELPER" \
+            --assessments "$ASSESSMENTS_JSONL" \
+            --cvedetails "$CVEDETAILS_JSONL" \
+            --tag-cache "$TAG_CACHE_TSV" \
+            --output "$REPORT_TMP" \
+            --min-score "$MIN_SCORE" \
+            --max-score "$MAX_SCORE" 2>"$_enrich_stderr"; then
+        log_error "enrich_cvedetails.py failed: $(head -c 500 "$_enrich_stderr")"
+        rm -f "$_enrich_stderr"
+        exit 2
+    fi
+    _enrich_summary=$(tail -1 "$_enrich_stderr")
+    rm -f "$_enrich_stderr"
+    _t_phase2d_ms=$(_elapsed_ms "$_t_phase2d_start")
+    log_info "phase2d merge: ${_enrich_summary} time_ms=${_t_phase2d_ms}"
+    echo "Merge:     ${_enrich_summary}, ${_t_phase2d_ms}ms"
+
+    # TOTAL_PROCESSED reflects rows emitted to the CSV (after min/max filter).
+    TOTAL_PROCESSED=$(echo "$_enrich_summary" | sed -n 's/.*rows_emitted=\([0-9]*\).*/\1/p')
+    TOTAL_PAGES=$(( _assessments_batches + _cvedetails_batches ))
+
+else
+    # ───── Legacy per-digest path (block / unblock) ─────────────────────
+    for pair in "${DIGEST_PAIRS[@]}"; do
     DIGEST_NUM=$((DIGEST_NUM + 1))
     _repo="${pair%%|*}"
     _digest="${pair##*|}"
@@ -1420,7 +1765,8 @@ for pair in "${DIGEST_PAIRS[@]}"; do
 
     echo "[${DIGEST_NUM}/${TOTAL_DIGESTS}] ${_repo} @${_digest:(-12)}: ${_digest_rows} row(s), ${_digest_pages} page(s), ${_t_digest_ms}ms"
     log_info "digest ${DIGEST_NUM}/${TOTAL_DIGESTS} repo=${_repo} digest_short=${_digest:(-12)} pages=${_digest_pages} rows=${_digest_rows} time_ms=${_t_digest_ms}"
-done
+    done
+fi
 
 # All pages processed successfully — promote the tmp CSV to the final name
 # atomically. Unset REPORT_TMP so the EXIT trap doesn't remove it.
