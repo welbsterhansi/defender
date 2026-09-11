@@ -1,28 +1,19 @@
 #!/usr/bin/env bash
-# test_split_query.sh v2 — multi-digest loop, emite CSV no formato exato
-# de producao (18 colunas, mesma ordem/nomes de defender.sh:977).
+# test_split_query.sh v3 — multi-digest loop + skip-token pagination + retry
 #
-# Estrategia:
-#   - Loop por digest.
-#   - Pra cada digest, chama ARG via az rest (api 2022-10-01, default scope)
-#     com KQL Daniel-style (JOIN inline com cvedetails, filtro por 1 digest).
-#   - Extends adicionais pra cobrir os 5 campos que Daniel nao traz:
-#       packageCategory, packageLanguage, remediation,
-#       lastPushedToRegistryUTC, patchable
-#     + cveAgeDays (derivado de PublishedDate).
-#   - Coalesces identicos aos de defender.sh (mesmos fallbacks).
-#   - Emite CSV unico com header + linhas de todos os digests.
+# Melhorias sobre v2:
+#   1. Skip-token pagination: itera todas paginas por digest (nao trunca em 1000).
+#   2. Retry/backoff [2, 5]s por page em erros HTTP/rede/UnexpectedQueryExecutionError.
+#   3. Validacao de field count == 18 no CSV final (via python3 csv module).
+#   4. Resumo tabular por digest (pages, rows, enriched, tempo).
 #
 # Uso:
 #   ./test_split_query.sh <digest1> [digest2] [digest3] ...
 #
-# Exemplo:
-#   ./test_split_query.sh \
-#     sha256:9fd3febced652e9318e5782ac993cd080ef26a03c65d039c40ecf533d69b9bcf \
-#     sha256:aaaa...
-#
 # Output:
-#   test_output_<timestamp>.csv (18 colunas, formato defender.sh)
+#   test_output_<UTC-timestamp>.csv (18 colunas, formato exato defender.sh:977)
+#
+# Requisitos: az cli logado, jq, python3 (opcional, so pra validacao final).
 
 set -euo pipefail
 
@@ -40,11 +31,9 @@ fi
 DIGESTS=("$@")
 API="https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01"
 OUTPUT_CSV="test_output_$(date -u +%Y%m%dT%H%M%SZ).csv"
-
-# ---------- CSV header: 18 colunas na ordem exata de defender.sh:977 ----------
+EXPECTED_FIELDS=18
 
 CSV_HEADER="repository,digest,cvssScore,cveId,severityRaw,packageCategory,packageLanguage,packageName,currentVersion,fixedVersion,patchable,remediation,fixStatus,cveAgeDays,isInExploitKit,hasPublishedExploit,hasVerifiedExploit,lastPushedToRegistryUTC"
-
 echo "$CSV_HEADER" > "$OUTPUT_CSV"
 
 # ---------- KQL template (interpola $DIGEST no loop) ----------
@@ -177,82 +166,171 @@ securityresources
 KQL_END
 }
 
+# ---------- az rest com retry/backoff [2, 5]s ----------
+# Sucesso: seta LAST_RESP e retorna 0. Falha apos 3 tentativas: retorna 1.
+
+az_rest_retry() {
+    local body="$1"
+    local delays=(2 5)
+    local attempt rc err
+    for attempt in 1 2 3; do
+        if LAST_RESP=$(az rest --method post --url "$API" --body "$body" 2>&1); then
+            return 0
+        fi
+        rc=$?
+        err=$(head -c 200 <<<"$LAST_RESP")
+        echo "    WARN: tentativa ${attempt}/3 falhou (rc=$rc): ${err}" >&2
+        if [[ $attempt -lt 3 ]]; then
+            local delay="${delays[$((attempt-1))]}"
+            echo "    retry em ${delay}s..." >&2
+            sleep "$delay"
+        fi
+    done
+    return 1
+}
+
 # ---------- loop principal ----------
 
 TOTAL_ROWS=0
 TOTAL_ENRICHED=0
 DIGESTS_OK=0
 DIGESTS_FAIL=0
+declare -a SUMMARY_LINES
+SUMMARY_LINES+=("digest	pages	rows	enriched	time")
 
 for DIGEST in "${DIGESTS[@]}"; do
     echo "=== digest: $DIGEST ==="
 
     KQL=$(kql_for_digest "$DIGEST")
-    BODY=$(jq -nc --arg q "$KQL" '{query: $q, options: {"$top": 1000}}')
+    NEXT_TOKEN=""
+    PAGE=0
+    DIGEST_ROWS=0
+    DIGEST_ENRICHED=0
+    DIGEST_START=$(date +%s)
+    DIGEST_FAILED=0
 
-    START=$(date +%s)
-    if ! RESP=$(az rest --method post --url "$API" --body "$BODY" 2>&1); then
-        echo "  FALHA: $(head -c 200 <<<"$RESP")" >&2
+    while true; do
+        PAGE=$((PAGE + 1))
+        if [[ -z "$NEXT_TOKEN" ]]; then
+            BODY=$(jq -nc --arg q "$KQL" '{query: $q, options: {"$top": 1000}}')
+        else
+            BODY=$(jq -nc --arg q "$KQL" --arg t "$NEXT_TOKEN" \
+                '{query: $q, options: {"$top": 1000, "$skipToken": $t}}')
+        fi
+
+        if ! az_rest_retry "$BODY"; then
+            echo "  FALHA definitiva na page $PAGE apos 3 retries — pulando digest" >&2
+            DIGEST_FAILED=1
+            break
+        fi
+
+        COUNT=$(jq '.data | length' <<<"$LAST_RESP")
+        ENRICHED=$(jq '[.data[] | select(.cvssScore != null and .cvssScore > 0)] | length' <<<"$LAST_RESP")
+
+        DIGEST_ROWS=$((DIGEST_ROWS + COUNT))
+        DIGEST_ENRICHED=$((DIGEST_ENRICHED + ENRICHED))
+
+        # append CSV
+        jq -r '.data[] | [
+            .repository, .digest, .cvssScore, .cveId, .severityRaw,
+            .packageCategory, .packageLanguage, .packageName, .currentVersion, .fixedVersion,
+            .patchable, .remediation, .fixStatus, .cveAgeDays,
+            .isInExploitKit, .hasPublishedExploit, .hasVerifiedExploit, .lastPushedToRegistryUTC
+        ] | @csv' <<<"$LAST_RESP" >> "$OUTPUT_CSV"
+
+        echo "  page $PAGE: ${COUNT} linhas (${ENRICHED} enriched)"
+
+        NEXT_TOKEN=$(jq -r '.["$skipToken"] // empty' <<<"$LAST_RESP")
+        if [[ -z "$NEXT_TOKEN" ]]; then
+            break
+        fi
+    done
+
+    DIGEST_ELAPSED=$(( $(date +%s) - DIGEST_START ))
+
+    # digest short pra tabela (ultimos 12 chars do sha)
+    DIGEST_SHORT="${DIGEST:(-12)}"
+
+    if [[ $DIGEST_FAILED -eq 1 ]]; then
         DIGESTS_FAIL=$((DIGESTS_FAIL + 1))
+        SUMMARY_LINES+=("${DIGEST_SHORT}	${PAGE}	${DIGEST_ROWS}	${DIGEST_ENRICHED}	${DIGEST_ELAPSED}s FAIL")
         continue
     fi
-    ELAPSED=$(( $(date +%s) - START ))
 
-    COUNT=$(jq '.data | length' <<<"$RESP")
-    if [[ "$COUNT" -eq 0 ]]; then
+    if [[ $DIGEST_ROWS -eq 0 ]]; then
+        DIGESTS_FAIL=$((DIGESTS_FAIL + 1))
+        SUMMARY_LINES+=("${DIGEST_SHORT}	0	0	0	${DIGEST_ELAPSED}s 0-rows")
         echo "  0 linhas (digest nao existe no tenant ou sem CVEs)" >&2
-        DIGESTS_FAIL=$((DIGESTS_FAIL + 1))
         continue
     fi
 
-    ENRICHED=$(jq '[.data[] | select(.cvssScore != null and .cvssScore > 0)] | length' <<<"$RESP")
-    echo "  linhas: $COUNT | enriched (CVSS>0): $ENRICHED | tempo: ${ELAPSED}s"
-
-    if [[ "$COUNT" -eq 1000 ]]; then
-        echo "  AVISO: bateu no limite de 1000 linhas — pode ter truncado." >&2
-        echo "         Producao vai precisar de paginacao via skip-token." >&2
-    fi
-
-    # append CSV: jq @csv escapa aspas/virgulas automaticamente
-    jq -r '.data[] | [
-        .repository, .digest, .cvssScore, .cveId, .severityRaw,
-        .packageCategory, .packageLanguage, .packageName, .currentVersion, .fixedVersion,
-        .patchable, .remediation, .fixStatus, .cveAgeDays,
-        .isInExploitKit, .hasPublishedExploit, .hasVerifiedExploit, .lastPushedToRegistryUTC
-    ] | @csv' <<<"$RESP" >> "$OUTPUT_CSV"
-
-    TOTAL_ROWS=$((TOTAL_ROWS + COUNT))
-    TOTAL_ENRICHED=$((TOTAL_ENRICHED + ENRICHED))
     DIGESTS_OK=$((DIGESTS_OK + 1))
+    TOTAL_ROWS=$((TOTAL_ROWS + DIGEST_ROWS))
+    TOTAL_ENRICHED=$((TOTAL_ENRICHED + DIGEST_ENRICHED))
+    SUMMARY_LINES+=("${DIGEST_SHORT}	${PAGE}	${DIGEST_ROWS}	${DIGEST_ENRICHED}	${DIGEST_ELAPSED}s")
 done
 
-# ---------- resumo ----------
+# ---------- validacao de field count (opcional, precisa python3) ----------
 
-echo ""
-echo "=== RESUMO ==="
-echo "digests processados: ${#DIGESTS[@]}  (ok=$DIGESTS_OK, fail=$DIGESTS_FAIL)"
-echo "total de linhas:    $TOTAL_ROWS"
-if [[ "$TOTAL_ROWS" -gt 0 ]]; then
-    RATE=$(( TOTAL_ENRICHED * 100 / TOTAL_ROWS ))
-    echo "enriched (CVSS>0):  $TOTAL_ENRICHED  (${RATE}%)"
+BAD_FIELD_LINES="?"
+if command -v python3 >/dev/null 2>&1; then
+    BAD_FIELD_LINES=$(python3 - "$OUTPUT_CSV" "$EXPECTED_FIELDS" <<'PY'
+import csv, sys
+path, expected = sys.argv[1], int(sys.argv[2])
+bad = 0
+with open(path, newline='', encoding='utf-8') as f:
+    reader = csv.reader(f)
+    for i, row in enumerate(reader, 1):
+        if len(row) != expected:
+            bad += 1
+            if bad <= 3:
+                print(f"  line {i}: {len(row)} fields (esperado {expected})", file=sys.stderr)
+print(bad)
+PY
+)
 fi
-echo "CSV gerado:         $OUTPUT_CSV"
+
+# ---------- resumo tabular ----------
 
 echo ""
-echo "--- preview do CSV (5 primeiras linhas apos header) ---"
-head -6 "$OUTPUT_CSV" | column -t -s ','
+echo "=== RESUMO POR DIGEST ==="
+printf '%s\n' "${SUMMARY_LINES[@]}" | column -t -s $'\t'
 
 echo ""
-if [[ "$DIGESTS_FAIL" -gt 0 ]]; then
-    echo "RESULTADO: PARCIAL — $DIGESTS_FAIL de ${#DIGESTS[@]} digests falharam."
+echo "=== TOTAIS ==="
+echo "digests processados: ${#DIGESTS[@]}  (ok=${DIGESTS_OK}, fail=${DIGESTS_FAIL})"
+echo "total de linhas:     ${TOTAL_ROWS}"
+if [[ $TOTAL_ROWS -gt 0 ]]; then
+    RATE=$(( TOTAL_ENRICHED * 100 / TOTAL_ROWS ))
+    echo "enriched (CVSS>0):   ${TOTAL_ENRICHED}  (${RATE}%)"
+fi
+echo "field count validation: ${BAD_FIELD_LINES} linhas com != ${EXPECTED_FIELDS} campos"
+echo "CSV gerado:          ${OUTPUT_CSV}"
+
+echo ""
+echo "--- preview do CSV (5 primeiras linhas) ---"
+head -6 "$OUTPUT_CSV" | cut -c 1-200
+
+# ---------- verdict ----------
+
+echo ""
+if [[ $DIGESTS_FAIL -gt 0 ]]; then
+    echo "RESULTADO: PARCIAL — ${DIGESTS_FAIL} de ${#DIGESTS[@]} digests falharam ou vieram vazios."
     exit 2
-elif [[ "$TOTAL_ENRICHED" -eq 0 ]]; then
-    echo "RESULTADO: FALHOU — 0% enriched."
+elif [[ $TOTAL_ROWS -eq 0 ]]; then
+    echo "RESULTADO: FALHOU — nenhuma linha coletada."
     exit 3
-elif [[ "$TOTAL_ENRICHED" -lt "$TOTAL_ROWS" ]]; then
-    echo "RESULTADO: PARCIAL — enriched < total. Investigar linhas sem CVSS."
+elif [[ "$BAD_FIELD_LINES" != "0" && "$BAD_FIELD_LINES" != "?" ]]; then
+    echo "RESULTADO: FALHOU — ${BAD_FIELD_LINES} linhas com field count errado (esperado ${EXPECTED_FIELDS})."
+    exit 4
+elif [[ $TOTAL_ENRICHED -eq 0 ]]; then
+    echo "RESULTADO: FALHOU — 0% enriched (JOIN com cvedetails nao bateu)."
+    exit 5
+elif [[ $TOTAL_ENRICHED -lt $TOTAL_ROWS ]]; then
+    RATE=$(( TOTAL_ENRICHED * 100 / TOTAL_ROWS ))
+    echo "RESULTADO: PARCIAL — ${RATE}% enriched. Investigar linhas sem CVSS."
+    exit 0
 else
-    echo "RESULTADO: OK — 100% enriched, todos os 18 campos populados."
-    echo "           Compare $OUTPUT_CSV com um CSV antigo de vulnerable_images_report.csv."
-    echo "           Se bater linha/coluna, podemos refatorar defender.sh."
+    echo "RESULTADO: OK — 100% enriched, todos os campos validados."
+    echo "           Proximo passo: comparar ${OUTPUT_CSV} com vulnerable_images_report.csv antigo."
 fi
