@@ -61,10 +61,26 @@ printf "bash unique:   %s\npython unique: %s\nso no bash:    %s\nso no python:  
     "$(comm -13 /tmp/_sh_notag.csv /tmp/_py_notag.csv | wc -l)"
 
 echo ""
-echo "=== 5. cvssScore distribuicao nas rows unicas de cada lado ==="
-echo "-- so no bash --"
-comm -23 /tmp/_sh_notag.csv /tmp/_py_notag.csv | awk -F',' '{print $4}' | sort | uniq -c | sort -rn | head -6
-echo "-- so no python --"
-comm -13 /tmp/_sh_notag.csv /tmp/_py_notag.csv | awk -F',' '{print $4}' | sort | uniq -c | sort -rn | head -6
+echo "=== 5. Padrao cvssScore nas rows unicas ==="
+_sh_diff=$(comm -23 /tmp/_sh_notag.csv /tmp/_py_notag.csv)
+_py_diff=$(comm -13 /tmp/_sh_notag.csv /tmp/_py_notag.csv)
+_sh_total=$(printf '%s\n' "$_sh_diff" | grep -c . || echo 0)
+_py_total=$(printf '%s\n' "$_py_diff" | grep -c . || echo 0)
+_sh_seven=$(printf '%s\n' "$_sh_diff" | awk -F',' '$4=="\"7\""' | wc -l)
+_py_seven=$(printf '%s\n' "$_py_diff" | awk -F',' '$4=="\"7\""' | wc -l)
+printf "so no bash:    %s de %s tem cvss=7 (fallback)\n" "$_sh_seven" "$_sh_total"
+printf "so no python:  %s de %s tem cvss=7 (fallback)\n" "$_py_seven" "$_py_total"
+
+# Salva output completo em arquivo pra debug (caso foto falhe)
+{
+    echo "--- so no bash (distribuicao cvssScore) ---"
+    printf '%s\n' "$_sh_diff" | awk -F',' '{print $4}' | sort | uniq -c | sort -rn
+    echo ""
+    echo "--- so no python (distribuicao cvssScore) ---"
+    printf '%s\n' "$_py_diff" | awk -F',' '{print $4}' | sort | uniq -c | sort -rn
+} > diff_details.txt
+
+echo ""
+echo "(detalhes completos em: diff_details.txt — use 'cat diff_details.txt')"
 
 rm -f /tmp/_sh_notag.csv /tmp/_py_notag.csv
