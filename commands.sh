@@ -17,9 +17,11 @@ set +e
 # ── 0. Garantir CVE CSV com escopo largo (usa python scan — P0.5 validado) ─
 if [ ! -f scan_broad.csv ]; then
     echo ">> gerando scan_broad.csv (python defender_pipeline scan full ACR 9-10 --skip-tags) ..."
+    echo "   (progress ao vivo abaixo; log completo em scan_broad_gen.log)"
+    # 2>&1 primeiro, depois tee → user ve os [phase N/M] e [batch N/M] live
     python -m defender_pipeline scan \
         --acr-name bdsoregistry --min-score 9 --max-score 10 --skip-tags \
-        --output scan_broad.csv > scan_broad_gen.log 2>&1
+        --output scan_broad.csv 2>&1 | tee scan_broad_gen.log
     if [ ! -f scan_broad.csv ]; then
         echo "erro: python scan nao produziu CSV. Ver scan_broad_gen.log"
         exit 1
@@ -28,16 +30,16 @@ fi
 _cve_rows=$(($(wc -l < scan_broad.csv) - 1))
 echo "input CVE CSV: scan_broad.csv ($_cve_rows CVE rows)"
 
-# ── 1. Rodar os dois back-to-back ────────────────────────────────────────
-echo ">> rodando check_ocp.sh ..."
+# ── 1. Rodar os dois back-to-back (bash silencioso, python live) ─────────
+echo ">> rodando check_ocp.sh (log em bash_cluster.log) ..."
 ./check_ocp.sh scan_broad.csv bash_cluster.csv > bash_cluster.log 2>&1
 _bash_exit=$?
 
-echo ">> rodando python -m defender_pipeline cluster ..."
+echo ">> rodando python -m defender_pipeline cluster (progress ao vivo) ..."
 python -m defender_pipeline cluster \
     --vulnerabilities scan_broad.csv \
-    --output python_cluster.csv > python_cluster.log 2>&1
-_py_exit=$?
+    --output python_cluster.csv 2>&1 | tee python_cluster.log
+_py_exit=${PIPESTATUS[0]}
 
 # ── 2. Veredictos ────────────────────────────────────────────────────────
 _bash_lines=$(($(wc -l < bash_cluster.csv 2>/dev/null || echo 1) - 1))
