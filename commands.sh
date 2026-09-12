@@ -59,4 +59,12 @@ printf "bash unique:   %s\npython unique: %s\nso no bash:    %s\nso no python:  
     "$(wc -l < /tmp/_py_notag.csv)" \
     "$(comm -23 /tmp/_sh_notag.csv /tmp/_py_notag.csv | wc -l)" \
     "$(comm -13 /tmp/_sh_notag.csv /tmp/_py_notag.csv | wc -l)"
+
+echo ""
+echo "=== 5. cvssScore distribuicao nas rows unicas de cada lado ==="
+echo "-- so no bash --"
+comm -23 /tmp/_sh_notag.csv /tmp/_py_notag.csv | awk -F',' '{print $4}' | sort | uniq -c | sort -rn | head -6
+echo "-- so no python --"
+comm -13 /tmp/_sh_notag.csv /tmp/_py_notag.csv | awk -F',' '{print $4}' | sort | uniq -c | sort -rn | head -6
+
 rm -f /tmp/_sh_notag.csv /tmp/_py_notag.csv
