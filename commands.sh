@@ -177,3 +177,59 @@ print(f"so no bash (tuplas):   {len(bash - py)}")
 print(f"so no python (tuplas): {len(py - bash)}")
 print(f"comum (tuplas):        {len(bash & py)}")
 PY
+
+# ── 8. Comparacao lado a lado de 3 tuplas divergentes ────────────────────
+# Para cada tupla so-no-python, procura no bash pela chave curta
+# (digest, cveId, packageName) e mostra o que difere em (currentVersion,
+# fixedVersion). Isso mostra se o problema e versao de pacote, valor
+# de campo, ou tupla totalmente ausente.
+echo ""
+echo "=== 8. Amostra tuplas divergentes (3 de cada lado) ==="
+python3 <<'PY'
+import csv
+
+FULL = ("digest","cveId","packageName","currentVersion","fixedVersion")
+SHORT = ("digest","cveId","packageName")
+
+def load(path):
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        rows.extend(list(csv.DictReader(f)))
+    return rows
+
+def full_keys(rows):
+    return {tuple(r.get(k,"") for k in FULL): r for r in rows}
+
+def short_index(rows):
+    idx = {}
+    for r in rows:
+        idx.setdefault(tuple(r.get(k,"") for k in SHORT), []).append(r)
+    return idx
+
+sh_rows = load("scan_shell.csv"); py_rows = load("scan.csv")
+sh_full = full_keys(sh_rows); py_full = full_keys(py_rows)
+sh_idx = short_index(sh_rows); py_idx = short_index(py_rows)
+
+def show(label, keys_only_here, this_full, other_idx, other_label):
+    print(f"-- 3 tuplas so no {label} --")
+    for k in list(keys_only_here)[:3]:
+        row = this_full[k]
+        short = tuple(row.get(x,"") for x in SHORT)
+        print(f"  {row.get('cveId')} / {row.get('packageName')}")
+        print(f"    {label}: curVer={row.get('currentVersion')!r} fixVer={row.get('fixedVersion')!r}")
+        matches = other_idx.get(short, [])
+        if matches:
+            for m in matches[:2]:
+                print(f"    {other_label} (mesma chave curta): curVer={m.get('currentVersion')!r} fixVer={m.get('fixedVersion')!r}")
+        else:
+            print(f"    {other_label}: (nenhuma row com essa chave curta)")
+
+show("python", set(py_full) - set(sh_full), py_full, sh_idx, "bash  ")
+print()
+show("bash  ", set(sh_full) - set(py_full), sh_full, py_idx, "python")
+PY
+
+# ── 9. Ambos mergers no MESMO input (veredicto merger vs pipeline) ──────
+echo ""
+echo "=== 9. decision_dump — mesmo input alimentando os 2 mergers ==="
+python3 decision_dump.py bdsoregistry redhat-sso-7/rhsso75 7 10 2>&1 | tail -20
