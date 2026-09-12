@@ -49,13 +49,98 @@ def _not_yet_implemented(subcommand: str, task_id: str) -> NoReturn:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    """Report-only ACR scan. Implemented in P0.5."""
-    _not_yet_implemented("scan", "P0.5")
+    """Report-only ACR scan — Python API-first (P0.5).
+
+    Uses Azure SDK directly (no `az`/`az rest`/subprocess). Same output
+    as ``defender.sh`` in report-only mode: 19-column CSV at
+    ``args.output``.
+    """
+    from pathlib import Path
+
+    from defender_pipeline.config import from_env
+    from defender_pipeline.findings.scan import ScanOptions, run_scan
+    from defender_pipeline.logging_setup import setup
+
+    setup(log_format=args.log_format, level=args.log_level)
+
+    scan_repository, scan_digest = _parse_scan_image_ref(args.scan_image)
+
+    repositories: list[str] | None = None
+    if args.repositories:
+        repositories = [r.strip() for r in args.repositories.split(",") if r.strip()]
+
+    opts = ScanOptions(
+        acr_name=args.acr_name,
+        min_score=args.min_score,
+        max_score=args.max_score,
+        repository=args.repository,
+        repositories=repositories,
+        scan_repository=scan_repository,
+        scan_digest=scan_digest,
+        skip_tags=args.skip_tags,
+        output=Path(args.output),
+    )
+
+    config = from_env()
+    if args.parallelism != 8:
+        # CLI override wins over env.
+        from dataclasses import replace
+        config = replace(config, max_workers=args.parallelism)
+
+    try:
+        rows = run_scan(opts, config=config)
+    except Exception as exc:
+        print(f"scan failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print(f"scan complete: {rows} rows written to {args.output}", file=sys.stderr)
+    return EXIT_OK
+
+
+def _parse_scan_image_ref(ref: str | None) -> tuple[str | None, str | None]:
+    """Parse a `--scan-image` value into (repository, digest).
+
+    Formats accepted:
+      * ``repo``                     → (repo, None)
+      * ``repo:tag``                 → (repo, None) — tag ignored at scan-time
+      * ``repo@sha256:<hex>``        → (repo, "sha256:<hex>")
+    """
+    if not ref:
+        return None, None
+    if "@" in ref:
+        repo, digest = ref.split("@", 1)
+        return repo, digest
+    if ":" in ref:
+        repo, _tag = ref.split(":", 1)
+        return repo, None
+    return ref, None
 
 
 def cmd_cluster(args: argparse.Namespace) -> int:
-    """OpenShift cross-reference. Implemented in P0.6."""
-    _not_yet_implemented("cluster", "P0.6")
+    """OpenShift cross-reference — Python API-first (P0.6).
+
+    Uses the kubernetes Python client directly (no ``oc`` subprocess).
+    Same output as ``check_ocp.sh``: 24-column CSV at ``args.output``.
+    Exit code follows the frozen coverage contract (0 COMPLETE, 3 PARTIAL).
+    """
+    from pathlib import Path
+
+    from defender_pipeline.logging_setup import setup
+    from defender_pipeline.openshift.cluster import ClusterOptions, run_cluster
+
+    setup(log_format=args.log_format, level=args.log_level)
+
+    opts = ClusterOptions(
+        vulnerabilities=Path(args.vulnerabilities),
+        output=Path(args.output),
+        kubeconfig=Path(args.kubeconfig) if args.kubeconfig else None,
+    )
+
+    try:
+        return run_cluster(opts)
+    except Exception as exc:
+        print(f"cluster failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
 
 
 def cmd_expand(args: argparse.Namespace) -> int:
@@ -74,9 +159,64 @@ def cmd_all(args: argparse.Namespace) -> int:
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
-    """Byte-diff bash pipeline vs Python pipeline for validation.
-    Implemented alongside P0.5 (once there's Python output to diff)."""
-    _not_yet_implemented("diff", "P0.5")
+    """Byte-diff bash pipeline vs Python pipeline for validation (P0.5).
+
+    Reads both CSVs, compares header + row content. Exit 0 = identical,
+    1 = differences found. Prints a short summary to stderr and (on
+    diff) the first N differing lines with a hint.
+    """
+    from pathlib import Path
+
+    bash_csv = Path(args.bash_csv)
+    py_csv = Path(args.python_csv)
+
+    if not bash_csv.exists():
+        print(f"error: bash CSV not found: {bash_csv}", file=sys.stderr)
+        return EXIT_ERROR
+    if not py_csv.exists():
+        print(f"error: python CSV not found: {py_csv}", file=sys.stderr)
+        return EXIT_ERROR
+
+    bash_lines = bash_csv.read_text(encoding="utf-8").splitlines()
+    py_lines = py_csv.read_text(encoding="utf-8").splitlines()
+
+    if bash_lines == py_lines:
+        print(
+            f"diff: identical ({len(bash_lines)} lines) — {bash_csv} == {py_csv}",
+            file=sys.stderr,
+        )
+        return EXIT_OK
+
+    # Report differences.
+    print(
+        f"diff: bash={len(bash_lines)} lines, python={len(py_lines)} lines",
+        file=sys.stderr,
+    )
+
+    # Header
+    if bash_lines and py_lines and bash_lines[0] != py_lines[0]:
+        print("DIFF (header):", file=sys.stderr)
+        print(f"  - bash:   {bash_lines[0]}", file=sys.stderr)
+        print(f"  - python: {py_lines[0]}", file=sys.stderr)
+
+    # First 5 differing rows
+    diff_count = 0
+    for i, (a, b) in enumerate(zip(bash_lines, py_lines, strict=False)):
+        if a != b:
+            diff_count += 1
+            if diff_count <= 5:
+                print(f"DIFF (line {i + 1}):", file=sys.stderr)
+                print(f"  - bash:   {a}", file=sys.stderr)
+                print(f"  - python: {b}", file=sys.stderr)
+
+    remaining = abs(len(bash_lines) - len(py_lines))
+    total = diff_count + remaining
+    print(
+        f"diff: {total} differing/missing line(s); "
+        f"{'CSVs differ' if total else 'CSVs identical'}",
+        file=sys.stderr,
+    )
+    return EXIT_ERROR if total else EXIT_OK
 
 
 # ---------------------------------------------------------------------------

@@ -113,21 +113,10 @@ class TestCliHelp:
         assert sub in r.stdout
 
 
-class TestSubcommandsAreStubs:
-    """P0.4 registers subcommands but every handler exits 2 (not yet
-    implemented) with a pointer to the task that will finish it.
-    This guarantees no accidental "silent success" while the pipeline
-    is skeletonized."""
-
-    def test_scan_stub_exits_2(self) -> None:
-        r = _run_module("scan", "--acr-name", "dummy")
-        assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
-        assert "P0.5" in r.stderr
-
-    def test_cluster_stub_exits_2(self) -> None:
-        r = _run_module("cluster")
-        assert r.returncode == 2
-        assert "P0.6" in r.stderr
+class TestSubcommandsStillStubbed:
+    """Subcommands not yet implemented exit 2 with a task pointer.
+    scan (P0.5), diff (P0.5), cluster (P0.6) have already been
+    implemented — their behavior is covered in the sibling test files."""
 
     def test_expand_stub_exits_2(self) -> None:
         r = _run_module("expand")
@@ -143,11 +132,6 @@ class TestSubcommandsAreStubs:
         r = _run_module("all", "--acr-name", "dummy")
         assert r.returncode == 2
         assert "P0.7" in r.stderr
-
-    def test_diff_stub_exits_2(self) -> None:
-        r = _run_module("diff", "--bash-csv", "a.csv", "--python-csv", "b.csv")
-        assert r.returncode == 2
-        assert "P0.5" in r.stderr
 
 
 class TestScanScopeMutualExclusion:
