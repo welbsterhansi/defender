@@ -190,4 +190,26 @@ def merge(
             last_pushed_to_registry_utc=row.last_pushed_to_registry_utc,
         ))
 
+    # Deterministic sort — replaces the KQL ``order by cvssScore desc,
+    # repository asc`` we lost when the JOIN was split into batched
+    # assessments + cvedetails + local merge. Tie-break on digest/cveId/
+    # packageName so identical CVSS rows land in a stable, diff-friendly
+    # order across runs.
+    out.sort(key=lambda f: (
+        -_safe_float(f.cvss_score),  # cvssScore desc
+        f.repository,                 # repository asc
+        f.digest,                     # digest asc (tiebreak)
+        f.cve_id,                     # cveId asc (tiebreak)
+        f.package_name,               # packageName asc (tiebreak)
+    ))
     return out
+
+
+def _safe_float(s: str) -> float:
+    """cvss_score is stored as %g-formatted string; parse back for sort.
+    Never raises — defensive because empty/malformed values shouldn't
+    take down the whole scan."""
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0

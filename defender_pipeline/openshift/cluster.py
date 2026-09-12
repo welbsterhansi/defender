@@ -82,11 +82,22 @@ def _write_grouped_csv(flat_rows: list[dict[str, str]], output: Path) -> None:
     Delegates to ``group_findings.group_rows`` — the same function
     ``check_ocp.sh`` invokes via ``group_findings.py``. Guarantees
     byte-identical output between the two paths.
+
+    Deterministic sort applied before write: rows come out of the
+    cluster in Kubernetes list order (not stable across API calls) —
+    sort so diff/tests/downstream consumption is predictable across
+    runs. Sort order matches the natural grouping hierarchy:
+    NAMESPACE → PARENT_TYPE → PARENT_NAME → REPOSITORY → DIGEST.
     """
     from group_findings import OUTPUT_HEADER, group_rows
 
     output.parent.mkdir(parents=True, exist_ok=True)
     grouped = group_rows(flat_rows)
+
+    # OUTPUT_HEADER col indices: 0=NAMESPACE, 1=PARENT_TYPE,
+    # 2=PARENT_NAME, 3=REPOSITORY, 4=DIGEST
+    grouped.sort(key=lambda r: (r[0], r[1], r[2], r[3], r[4]))
+
     csv.field_size_limit(2**24)
     with output.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)

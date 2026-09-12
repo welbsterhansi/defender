@@ -419,6 +419,119 @@ class TestRunClusterEndToEnd:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Deterministic output ordering
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestOutputOrdering:
+    """Cluster CSV must come out sorted by
+    NAMESPACE → PARENT_TYPE → PARENT_NAME → REPOSITORY → DIGEST.
+    Kubernetes list order isn't stable across API calls, so downstream
+    tools/diff/tests need a deterministic write order."""
+
+    def _multi_cve_csv(self, tmp_path: Path) -> Path:
+        p = tmp_path / "multi.csv"
+        # 3 digests, keyed by short sha256 (padded to 64 hex)
+        p.write_text(
+            '"repository","digest","tag","cvssScore","cveId","severity",'
+            '"packageCategory","packageLanguage","packageName","currentVersion",'
+            '"fixedVersion","patchable","remediation","fixStatus","cveAgeDays",'
+            '"isInExploitKit","hasPublishedExploit","hasVerifiedExploit","lastPushedToRegistryUTC"\n'
+            + "".join(
+                f'"{repo}","sha256:{d}","v1","9.8","CVE-2024-{i}","Critical",'
+                '"OS","","openssl","1.0","2.0","true","up","FixAvailable","10",'
+                '"true","true","true","2024-01-01"\n'
+                for i, (repo, d) in enumerate([
+                    ("repo-z", "c" * 64),
+                    ("repo-a", "a" * 64),
+                    ("repo-m", "b" * 64),
+                ], start=1)
+            ),
+            encoding="utf-8",
+        )
+        return p
+
+    def test_rows_sorted_by_ns_parent_repo_digest(self, tmp_path: Path) -> None:
+        from defender_pipeline.openshift.cluster import (
+            ClusterOptions,
+            run_cluster,
+        )
+
+        cve_csv = self._multi_cve_csv(tmp_path)
+
+        # Kubernetes returns namespaces + pods in unpredictable order.
+        # Feed them scrambled so the test can't accidentally pass on
+        # insertion order.
+        mock_api = MagicMock()
+        mock_api.list_namespace.return_value = _ns_list([
+            "z-ns", "a-ns", "m-ns",
+        ])
+
+        def _pods_for(namespace: str, **_kw):
+            if namespace == "z-ns":
+                return _pod_list([
+                    _pod(name="p-z", namespace=namespace,
+                         owner_kind="ReplicaSet", owner_name="app-z-abc",
+                         image_ids=[f"docker-pullable://repo-z@sha256:{'c'*64}"]),
+                ])
+            if namespace == "a-ns":
+                return _pod_list([
+                    _pod(name="p-a", namespace=namespace,
+                         owner_kind="ReplicaSet", owner_name="app-a-abc",
+                         image_ids=[f"docker-pullable://repo-a@sha256:{'a'*64}"]),
+                ])
+            if namespace == "m-ns":
+                return _pod_list([
+                    _pod(name="p-m", namespace=namespace,
+                         owner_kind="ReplicaSet", owner_name="app-m-abc",
+                         image_ids=[f"docker-pullable://repo-m@sha256:{'b'*64}"]),
+                ])
+            return _pod_list([])
+
+        mock_api.list_namespaced_pod.side_effect = _pods_for
+
+        output = tmp_path / "sorted.csv"
+        with patch("defender_pipeline.openshift.cluster.get_core_api",
+                   return_value=mock_api), \
+             patch("defender_pipeline.openshift.cluster.log"):
+            run_cluster(ClusterOptions(vulnerabilities=cve_csv, output=output))
+
+        with output.open("r", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        # rows[0] = header; data starts at rows[1]
+        namespaces = [r[0] for r in rows[1:]]
+        assert namespaces == ["a-ns", "m-ns", "z-ns"], (
+            f"expected NS asc, got {namespaces}"
+        )
+
+    def test_output_stable_across_calls(self, tmp_path: Path) -> None:
+        """Same input twice must produce byte-identical CSV."""
+        from defender_pipeline.openshift.cluster import (
+            ClusterOptions,
+            run_cluster,
+        )
+
+        cve_csv = self._multi_cve_csv(tmp_path)
+        mock_api = MagicMock()
+        mock_api.list_namespace.return_value = _ns_list(["a-ns", "b-ns"])
+        mock_api.list_namespaced_pod.return_value = _pod_list([
+            _pod(name="p", namespace="a-ns",
+                 owner_kind="ReplicaSet", owner_name="app-abc",
+                 image_ids=[f"docker-pullable://repo-a@sha256:{'a'*64}"]),
+        ])
+
+        out1 = tmp_path / "run1.csv"
+        out2 = tmp_path / "run2.csv"
+        for out in (out1, out2):
+            with patch("defender_pipeline.openshift.cluster.get_core_api",
+                       return_value=mock_api), \
+                 patch("defender_pipeline.openshift.cluster.log"):
+                run_cluster(ClusterOptions(vulnerabilities=cve_csv, output=out))
+
+        assert out1.read_bytes() == out2.read_bytes()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CLI cmd_cluster
 # ═══════════════════════════════════════════════════════════════════════════
 

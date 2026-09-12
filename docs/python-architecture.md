@@ -361,6 +361,29 @@ Validated empirically at the client during P0.5 (2026-09-12):
       and tag-resolution differences.
     - `wc -l` equality between full-run outputs — same reason.
 
+### 11.1 OpenShift live-state volatility (P0.6, 2026-09-12)
+
+The same "eventual state" caveat applies to `check_ocp.sh` vs
+`defender_pipeline cluster` back-to-back on a live cluster:
+
+- `oc get pods` (bash) and `list_namespaced_pod` (kubernetes python
+  client) are called seconds apart. Pods can start, terminate, restart,
+  or move to a different node between the two calls. A pod that exists
+  when bash queries but is gone (or newly appeared) when python queries
+  produces a tuple present on only one side.
+- Validated empirically: full ACR score 9-10 scan → 111 cluster rows on
+  both sides, 110 tuples shared on
+  `(NAMESPACE, PARENT_TYPE, PARENT_NAME, REPOSITORY, DIGEST)` → **98.2%
+  overlap, exactly 1 tuple divergent each side**. Exit code, coverage
+  state, and header all matched.
+- Threshold used for "strong match": ≤10 divergent tuples per side. Under
+  that, we treat any divergence as live-state volatility, not a code
+  bug. A systemic bug would produce dozens of consistent divergences.
+- If a run shows divergence above threshold, first re-run to check
+  whether the delta shrinks — if it does, live-state volatility; if it
+  stays high, investigate `_resolve_parent()` / `_extract_image_digests()`
+  logic in `openshift/correlate.py`.
+
 ## 12. Non-goals (explicit)
 
 - Not building an SDK for third-party consumers. This is an internal pipeline.
