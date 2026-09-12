@@ -13,6 +13,12 @@ __pycache__/
 .venv/
 venv/
 
+# Coverage + browser automation caches (local only)
+.coverage
+.coverage.*
+htmlcov/
+.playwright-mcp/
+
 # Generated artifacts (regenerated per run)
 vulnerable_images_report.csv
 blocked_images_report.csv
@@ -27,3 +33,6 @@ logs/
 # Local planning notes — not for the client repo
 NOTES.md
 boss-list.txt
+docs/superpowers/
+erros.md
+script-emergencial/
