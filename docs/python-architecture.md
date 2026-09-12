@@ -331,7 +331,37 @@ These will be revisited when each corresponding task starts.
 
 ---
 
-## 11. Non-goals (explicit)
+## 11. Known behavior — ARG data volatility
+
+Validated empirically at the client during P0.5 (2026-09-12):
+
+- The two Azure Resource Graph tables the pipeline queries
+  (``microsoft.security/assessments`` and ``microsoft.security/cvedetails``)
+  are **eventually consistent**. Defender re-scans and re-aggregates them in
+  background. Two identical queries issued seconds apart routinely return
+  slightly different row sets (~1-5% drift observed).
+- Consequence: **byte-exact CSV diff between the Bash pipeline and the
+  Python pipeline running in separate processes is not a reliable validation
+  criterion.** A ~2 minute delta between runs can shift dozens of rows in
+  either direction (some CVEs gain enrichment, others lose it → filter
+  passes/drops differ).
+- Correct validation strategies:
+    1. **Contract compliance** — same 19-column schema, same field
+       semantics (frozen in ``docs/contracts/``).
+    2. **Merger equivalence with controlled input** — see
+       ``decision_dump.py``: fetches ARG data ONCE, feeds both
+       ``enrich_cvedetails.py`` (bash merger) and
+       ``defender_pipeline.findings.enrich.merge`` (python merger),
+       compares outputs. Identical output on identical input proves the
+       code paths are equivalent even when full-run outputs drift.
+    3. **Tuple-set overlap** on the 5-field key
+       ``(digest, cveId, packageName, currentVersion, fixedVersion)``.
+- Non-strategies (do NOT rely on these):
+    - `diff -u bash.csv python.csv` — will always show noise from ARG drift
+      and tag-resolution differences.
+    - `wc -l` equality between full-run outputs — same reason.
+
+## 12. Non-goals (explicit)
 
 - Not building an SDK for third-party consumers. This is an internal pipeline.
 - Not supporting Windows (Linux/WSL only, same as current).
