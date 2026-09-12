@@ -306,6 +306,62 @@ class TestEnrichMerge:
         assert len(findings) == 1
         assert findings[0].cve_id == "CVE-2024-1"
 
+    def test_deterministic_sort_order(self) -> None:
+        """CSV must come out sorted by cvssScore desc, then repository asc,
+        digest asc, cveId asc, packageName asc — replaces the KQL
+        ``order by`` we lost after the JOIN split. Diff/tests/downstream
+        depend on this being stable across runs."""
+        from defender_pipeline.findings.enrich import merge
+
+        # Deliberately provide input in reversed/scrambled order so the
+        # test would trivially pass if sort were absent AND happened to
+        # match insertion order. Different repos, digests, cvss.
+        rows = [
+            _mk_assessment(  # low cvss, later repo — should end up LAST
+                repository="zzz", digest="sha256:zzz",
+                cve_id="CVE-2024-99", package_name="pkg-z",
+                inline_severity="Low", inline_cvss_base=3.0,
+            ),
+            _mk_assessment(  # highest cvss — should be FIRST
+                repository="aaa", digest="sha256:aaa",
+                cve_id="CVE-2024-01", package_name="pkg-a",
+                inline_severity="Critical", inline_cvss_base=9.9,
+            ),
+            _mk_assessment(  # same cvss as first — repo asc tiebreak
+                repository="bbb", digest="sha256:bbb",
+                cve_id="CVE-2024-05", package_name="pkg-b",
+                inline_severity="Critical", inline_cvss_base=9.9,
+            ),
+            _mk_assessment(  # medium cvss — middle
+                repository="mmm", digest="sha256:mmm",
+                cve_id="CVE-2024-50", package_name="pkg-m",
+                inline_severity="High", inline_cvss_base=7.5,
+            ),
+        ]
+        findings = merge(rows, {}, {}, min_score=0, max_score=10)
+        cvss_order = [f.cvss_score for f in findings]
+        repo_order = [f.repository for f in findings]
+        assert cvss_order == ["9.9", "9.9", "7.5", "3"]
+        # Within tied cvss=9.9, repo asc breaks tie → aaa before bbb
+        assert repo_order[0] == "aaa"
+        assert repo_order[1] == "bbb"
+        assert repo_order[3] == "zzz"
+
+    def test_sort_is_stable_across_calls(self) -> None:
+        """Same input must produce byte-identical output every time —
+        no dict / set iteration order leaking through."""
+        from defender_pipeline.findings.enrich import merge
+        rows = [
+            _mk_assessment(repository="r2", digest="sha256:222",
+                           cve_id="CVE-2024-B", inline_cvss_base=8.0),
+            _mk_assessment(repository="r1", digest="sha256:111",
+                           cve_id="CVE-2024-A", inline_cvss_base=8.0),
+        ]
+        out1 = merge(rows, {}, {}, min_score=0, max_score=10)
+        out2 = merge(rows, {}, {}, min_score=0, max_score=10)
+        assert [f.repository for f in out1] == [f.repository for f in out2]
+        assert [f.repository for f in out1] == ["r1", "r2"]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Scan orchestrator — full pipeline with mocked ARG client

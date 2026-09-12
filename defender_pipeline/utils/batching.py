@@ -34,6 +34,7 @@ def run_batched_with_split(
     run_batch: Callable[[Sequence[T]], list[Any]],
     *,
     initial_batch_size: int,
+    on_batch_start: Callable[[int, int, int], None] | None = None,
 ) -> list[Any]:
     """Run ``run_batch(chunk)`` in ``initial_batch_size`` chunks.
 
@@ -42,12 +43,22 @@ def run_batched_with_split(
     split logs a WARN so operators know when the size is too big.
 
     A single-item chunk that fails raises :class:`BatchExhausted`.
+
+    Args:
+        items: full input list.
+        run_batch: callable that processes one chunk.
+        initial_batch_size: preferred chunk size (may be split on failure).
+        on_batch_start: optional callback ``(start, end, total)``, invoked
+            before each initial-size chunk is dispatched (not per split).
+            Used for per-batch visual progress in the CLI.
     """
     results: list[Any] = []
     start = 0
     while start < len(items):
         end = min(start + initial_batch_size, len(items))
         chunk = items[start:end]
+        if on_batch_start is not None:
+            on_batch_start(start, end, len(items))
         results.extend(_run_chunk_recursive(chunk, run_batch))
         start = end
     return results

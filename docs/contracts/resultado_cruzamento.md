@@ -58,7 +58,22 @@ Platform-managed namespaces are filtered out to reduce noise:
 
 Any change to this list must be documented here and mirrored in the Python `openshift/client.py` (task P0.6) when it lands.
 
+## Row order (Python producer only)
+
+The bash producer emits rows in `oc get pods` iteration order (unstable across API calls). The Python producer sorts before writing so diffs, tests, and downstream consumers are deterministic:
+
+1. `NAMESPACE` asc
+2. `PARENT_TYPE` asc
+3. `PARENT_NAME` asc
+4. `REPOSITORY` asc
+5. `DIGEST` asc
+
+This matches the natural grouping hierarchy (namespace → workload → image). Enforced by `defender_pipeline.openshift.cluster._write_grouped_csv` and covered by `tests/test_defender_pipeline_cluster.py::TestOutputOrdering`.
+
+Order is a **soft contract for the Python producer** — the bash producer may emit rows in any order Kubernetes returns.
+
 ## Guardrails
 
 - `tests/test_contracts.py::TestResultadoCruzamentoContract` — header parity between `check_ocp.sh:232` and the canonical spec above.
 - `tests/test_check_ocp_integration.py` — coverage classification behavior with mocked `oc`.
+- `tests/test_defender_pipeline_cluster.py::TestOutputOrdering` — Python producer emits rows in the sort order above; identical input produces identical output across runs.
