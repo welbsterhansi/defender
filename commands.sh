@@ -14,15 +14,16 @@
 
 set +e
 
-# ── 0. Garantir CVE CSV com escopo largo ────────────────────────────────
+# ── 0. Garantir CVE CSV com escopo largo (usa python scan — P0.5 validado) ─
 if [ ! -f scan_broad.csv ]; then
-    echo ">> gerando scan_broad.csv (defender.sh full ACR score 9-10 --skip-tags) ..."
-    ./defender.sh --acr-name bdsoregistry --min-score 9 --max-score 10 --skip-tags > scan_broad_gen.log 2>&1
-    if [ ! -f vulnerable_images_report.csv ]; then
-        echo "erro: defender.sh nao produziu CSV. Ver scan_broad_gen.log"
+    echo ">> gerando scan_broad.csv (python defender_pipeline scan full ACR 9-10 --skip-tags) ..."
+    python -m defender_pipeline scan \
+        --acr-name bdsoregistry --min-score 9 --max-score 10 --skip-tags \
+        --output scan_broad.csv > scan_broad_gen.log 2>&1
+    if [ ! -f scan_broad.csv ]; then
+        echo "erro: python scan nao produziu CSV. Ver scan_broad_gen.log"
         exit 1
     fi
-    mv vulnerable_images_report.csv scan_broad.csv
 fi
 _cve_rows=$(($(wc -l < scan_broad.csv) - 1))
 echo "input CVE CSV: scan_broad.csv ($_cve_rows CVE rows)"
