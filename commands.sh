@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
-# Diagnostico compacto — bash vs python scan (P0.5).
+# Teste controlado bash vs python — P0.5 scan compat check.
 #
-# Uso no cliente (assume que scan_shell.csv e scan.csv ja existem,
-# gerados com as MESMAS flags — idealmente com --skip-tags dos dois):
+# Roda os dois back-to-back com --skip-tags (elimina tag como
+# variavel) e imprime 4 numeros que respondem se ha divergencia.
 #
+# Uso:
 #     git pull origin fix/mdvm-migration-remove-leg-a
 #     bash commands.sh
 #
-# Output cabe em ~20 linhas — facil de tirar foto.
+# Assume: cwd tem defender.sh + venv ativo com defender_pipeline.
 
 set +e
 
+# ── 1. Rodar bash e python back-to-back (menos de 30s de intervalo) ──────
+echo ">> rodando defender.sh (bash) com --skip-tags ..."
+./defender.sh --acr-name bdsoregistry \
+              --repository redhat-sso-7/rhsso75 \
+              --min-score 7 --skip-tags > /dev/null 2>&1
+mv -f vulnerable_images_report.csv scan_shell.csv
+
+echo ">> rodando python -m defender_pipeline scan com --skip-tags ..."
+python -m defender_pipeline scan --acr-name bdsoregistry \
+    --repository redhat-sso-7/rhsso75 \
+    --min-score 7 --skip-tags --output scan.csv > /dev/null 2>&1
+
+# ── 2. Diagnostico compacto ─────────────────────────────────────────────
+echo ""
 echo "=== 1. Linhas ==="
 printf "bash:   %s\npython: %s\n" \
     "$(wc -l < scan_shell.csv)" "$(wc -l < scan.csv)"
