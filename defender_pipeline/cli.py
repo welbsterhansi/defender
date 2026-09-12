@@ -117,8 +117,30 @@ def _parse_scan_image_ref(ref: str | None) -> tuple[str | None, str | None]:
 
 
 def cmd_cluster(args: argparse.Namespace) -> int:
-    """OpenShift cross-reference. Implemented in P0.6."""
-    _not_yet_implemented("cluster", "P0.6")
+    """OpenShift cross-reference — Python API-first (P0.6).
+
+    Uses the kubernetes Python client directly (no ``oc`` subprocess).
+    Same output as ``check_ocp.sh``: 24-column CSV at ``args.output``.
+    Exit code follows the frozen coverage contract (0 COMPLETE, 3 PARTIAL).
+    """
+    from pathlib import Path
+
+    from defender_pipeline.logging_setup import setup
+    from defender_pipeline.openshift.cluster import ClusterOptions, run_cluster
+
+    setup(log_format=args.log_format, level=args.log_level)
+
+    opts = ClusterOptions(
+        vulnerabilities=Path(args.vulnerabilities),
+        output=Path(args.output),
+        kubeconfig=Path(args.kubeconfig) if args.kubeconfig else None,
+    )
+
+    try:
+        return run_cluster(opts)
+    except Exception as exc:
+        print(f"cluster failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
 
 
 def cmd_expand(args: argparse.Namespace) -> int:
