@@ -7,8 +7,258 @@ Phases (same as the bash implementation):
     2a. Batched assessments query (no JOIN, ~50 digests per call).
     2b. Extract unique CVE IDs from the assessments rows.
     2c. Batched cvedetails query (~500 CVE IDs per call).
-    2d. Local merge via ``findings.enrich``.
+    2d. Local merge via :mod:`findings.enrich`.
+    2e. Write final CSV with 19 columns via :mod:`utils.csvio`.
 
-Implemented in task P0.5.
+Failure mode: :class:`utils.batching.BatchTooComplex` from ARG is
+handled by the batch-split runner (halves recursively). Terminal
+failures propagate to the CLI which returns non-zero.
 """
 from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from time import monotonic
+
+from defender_pipeline.azure.acr import AcrTagResolver
+from defender_pipeline.azure.auth import get_credential
+from defender_pipeline.azure.queries import (
+    build_batched_assessments_query,
+    build_batched_cvedetails_query,
+    build_enumerate_digests_query,
+    build_scope_filter,
+)
+from defender_pipeline.azure.resource_graph import ResourceGraphClient
+from defender_pipeline.config import Config
+from defender_pipeline.findings.csv_contracts import (
+    VULNERABLE_IMAGES_HEADER_COLUMNS,
+)
+from defender_pipeline.findings.enrich import merge
+from defender_pipeline.findings.models import (
+    AssessmentRow,
+    DigestPair,
+    EnrichmentRow,
+    Finding,
+)
+from defender_pipeline.utils.batching import run_batched_with_split
+from defender_pipeline.utils.csvio import csv_field, csv_write_row
+
+log = logging.getLogger("defender_pipeline.findings.scan")
+
+
+@dataclass(frozen=True, slots=True)
+class ScanOptions:
+    acr_name: str
+    min_score: float = 9.0
+    max_score: float = 10.0
+    repository: str | None = None
+    repositories: Sequence[str] | None = None
+    scan_repository: str | None = None
+    scan_digest: str | None = None
+    skip_tags: bool = False
+    output: Path = Path("vulnerable_images_report.csv")
+
+
+def run_scan(
+    opts: ScanOptions,
+    *,
+    config: Config | None = None,
+    arg_client: ResourceGraphClient | None = None,
+    tag_resolver: AcrTagResolver | None = None,
+) -> int:
+    """Execute a full report-only scan. Returns the count of rows emitted.
+
+    Injectable ``arg_client`` and ``tag_resolver`` for testing.
+    """
+    config = config or Config()
+    credential = None  # lazy — only created if we need to build a client
+    if arg_client is None:
+        credential = get_credential()
+        arg_client = ResourceGraphClient(credential)
+    if tag_resolver is None and not opts.skip_tags:
+        credential = credential or get_credential()
+        tag_resolver = AcrTagResolver(credential, opts.acr_name)
+
+    # ── PHASE 0: enumerate ───────────────────────────────────────────
+    filter_kql = build_scope_filter(
+        repository=opts.repository,
+        repositories=opts.repositories,
+        scan_repository=opts.scan_repository,
+        scan_digest=opts.scan_digest,
+    )
+    t0 = monotonic()
+    digest_pairs = _phase0_enumerate(arg_client, filter_kql)
+    log.info(
+        "enumerate: found %d unique pairs time_ms=%d",
+        len(digest_pairs), int((monotonic() - t0) * 1000),
+    )
+
+    if not digest_pairs:
+        _write_csv([], opts.output)
+        log.info(
+            "end total_processed=0 digests=0 report_file=%s", opts.output,
+        )
+        return 0
+
+    # ── PHASE 1: tag_resolve ─────────────────────────────────────────
+    tag_cache: dict[str, str] = {}
+    if opts.skip_tags:
+        log.info("tag_resolve DISABLED via --skip-tags (all rows will have tag=N/A)")
+    else:
+        assert tag_resolver is not None
+        t1 = monotonic()
+        unique_repos = sorted({p.repository for p in digest_pairs})
+        log.info("tag_resolve: start unique_repos=%d", len(unique_repos))
+        tag_resolver.resolve_repos(unique_repos)
+        tag_cache = tag_resolver.tag_cache
+        log.info(
+            "tag_resolve: end api_calls=%d cached_pairs=%d time_ms=%d",
+            len(unique_repos) - len(tag_resolver.failed_repos),
+            len(tag_cache),
+            int((monotonic() - t1) * 1000),
+        )
+
+    # ── PHASE 2a: batched assessments ────────────────────────────────
+    digests = [p.digest for p in digest_pairs]
+    t2a = monotonic()
+    log.info(
+        "phase2a assessments_batched: start batch_size=%d pairs=%d",
+        config.assessments_batch_size, len(digests),
+    )
+    assessments = _phase2a_batched_assessments(
+        arg_client, digests, config.assessments_batch_size,
+    )
+    log.info(
+        "phase2a assessments_batched: end rows=%d time_ms=%d",
+        len(assessments), int((monotonic() - t2a) * 1000),
+    )
+
+    # ── PHASE 2b: unique CVE IDs ─────────────────────────────────────
+    t2b = monotonic()
+    unique_cves = sorted({a.cve_id.upper() for a in assessments if a.cve_id.startswith("CVE-")})
+    log.info(
+        "phase2b extract_cves: unique_cves=%d time_ms=%d",
+        len(unique_cves), int((monotonic() - t2b) * 1000),
+    )
+
+    # ── PHASE 2c: batched cvedetails ─────────────────────────────────
+    enrichment_by_cve: dict[str, EnrichmentRow] = {}
+    if unique_cves:
+        t2c = monotonic()
+        log.info(
+            "phase2c cvedetails_batched: start batch_size=%d",
+            config.cvedetails_batch_size,
+        )
+        enrichment_rows = _phase2c_batched_cvedetails(
+            arg_client, unique_cves, config.cvedetails_batch_size,
+        )
+        for e in enrichment_rows:
+            enrichment_by_cve[e.cve_id_join] = e
+        log.info(
+            "phase2c cvedetails_batched: end rows=%d time_ms=%d",
+            len(enrichment_rows), int((monotonic() - t2c) * 1000),
+        )
+
+    # ── PHASE 2d + 2e: merge + write CSV ─────────────────────────────
+    t2d = monotonic()
+    findings = merge(
+        assessments,
+        enrichment_by_cve,
+        tag_cache,
+        min_score=opts.min_score,
+        max_score=opts.max_score,
+    )
+    _write_csv(findings, opts.output)
+    log.info(
+        "phase2d merge: rows_read=%d rows_emitted=%d rows_enriched=%d "
+        "cvedetails_keys=%d time_ms=%d",
+        len(assessments), len(findings),
+        sum(1 for a in assessments if a.cve_id.upper() in enrichment_by_cve),
+        len(enrichment_by_cve),
+        int((monotonic() - t2d) * 1000),
+    )
+    log.info(
+        "end total_processed=%d digests=%d report_file=%s",
+        len(findings), len(digest_pairs), opts.output,
+    )
+    return len(findings)
+
+
+# ---------------------------------------------------------------------------
+# Phase helpers
+# ---------------------------------------------------------------------------
+
+
+def _phase0_enumerate(
+    client: ResourceGraphClient, filter_kql: str,
+) -> list[DigestPair]:
+    kql = build_enumerate_digests_query(filter_kql)
+    pairs: list[DigestPair] = []
+    for page in client.iter_pages(kql):
+        for row in page:
+            repo = str(row.get("_repository") or "")
+            digest = str(row.get("_digest") or "")
+            if repo and digest:
+                pairs.append(DigestPair(repository=repo, digest=digest))
+    # Dedup (KQL emits distinct but be defensive across pages)
+    seen: set[tuple[str, str]] = set()
+    unique: list[DigestPair] = []
+    for pair in pairs:
+        key = (pair.repository, pair.digest)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(pair)
+    return unique
+
+
+def _phase2a_batched_assessments(
+    client: ResourceGraphClient,
+    digests: Sequence[str],
+    batch_size: int,
+) -> list[AssessmentRow]:
+    def _run_one_batch(chunk: Sequence[str]) -> list[AssessmentRow]:
+        kql = build_batched_assessments_query(chunk)
+        rows: list[AssessmentRow] = []
+        for page in client.iter_pages(kql):
+            rows.extend(AssessmentRow.from_arg_row(row) for row in page)
+        return rows
+
+    return run_batched_with_split(
+        digests, _run_one_batch, initial_batch_size=batch_size,
+    )
+
+
+def _phase2c_batched_cvedetails(
+    client: ResourceGraphClient,
+    cve_ids: Sequence[str],
+    batch_size: int,
+) -> list[EnrichmentRow]:
+    def _run_one_batch(chunk: Sequence[str]) -> list[EnrichmentRow]:
+        kql = build_batched_cvedetails_query(chunk)
+        rows: list[EnrichmentRow] = []
+        for page in client.iter_pages(kql):
+            rows.extend(EnrichmentRow.from_arg_row(row) for row in page)
+        return rows
+
+    return run_batched_with_split(
+        cve_ids, _run_one_batch, initial_batch_size=batch_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CSV writer — reuses the bash-compat csv_field / csv_write_row
+# ---------------------------------------------------------------------------
+
+
+def _write_csv(findings: Sequence[Finding], path: Path) -> None:
+    """Write findings to a CSV using the bash-compat quoting."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        # Header — same format as `echo '"col","col"...' > $REPORT_TMP`
+        header_line = ",".join(csv_field(c) for c in VULNERABLE_IMAGES_HEADER_COLUMNS)
+        f.write(header_line + "\n")
+        for finding in findings:
+            csv_write_row(f, finding.as_csv_values())
