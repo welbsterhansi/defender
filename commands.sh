@@ -148,17 +148,32 @@ printf "%-24s %10s %10s\n" "merge rows_emitted"  "$_b_emit" "$_p_emit"
 echo ""
 echo "(logs completos em: bash_run.log, python_run.log, logs/run-*.log)"
 
-# ── 7. (digest, cveId, package) tuple overlap ────────────────────────────
-# Se os dois lados tem MESMA tupla mas emitem CSV rows diferentes,
-# a divergencia e no VALOR do campo (cvss/severity) — nao no filtro/dedup.
-# Se tuplas divergem, e filtro ou distinct de verdade.
-tail -n +2 scan_shell.csv | awk -F',' '{print $2 "|" $5 "|" $9}' | sort -u > /tmp/_sh_tup.txt
-tail -n +2 scan.csv       | awk -F',' '{print $2 "|" $5 "|" $9}' | sort -u > /tmp/_py_tup.txt
+# ── 7. Tuplas (digest,cveId,packageName,currentVersion,fixedVersion) ────
+# Usa Python csv (nao awk) para nao quebrar em campos com virgulas.
+# Chave estendida para desambiguar mesma package em versoes diferentes.
+#
+# Se tuplas batem nos dois lados → divergencia e VALOR de campo
+# (cvss / enrichment volatilidade / formatacao). NAO e bug de codigo.
+# Se tuplas divergem → filter/dedup produz conjuntos diferentes: bug.
 echo ""
-echo "=== 7. Tuplas (digest,cveId,package) unicas ==="
-printf "bash:                  %s\npython:                %s\nso no bash (tuplas):   %s\nso no python (tuplas): %s\n" \
-    "$(wc -l < /tmp/_sh_tup.txt)" \
-    "$(wc -l < /tmp/_py_tup.txt)" \
-    "$(comm -23 /tmp/_sh_tup.txt /tmp/_py_tup.txt | wc -l)" \
-    "$(comm -13 /tmp/_sh_tup.txt /tmp/_py_tup.txt | wc -l)"
-rm -f /tmp/_sh_tup.txt /tmp/_py_tup.txt
+echo "=== 7. Tuplas (digest,cveId,pkgName,curVer,fixVer) unicas ==="
+python3 <<'PY'
+import csv
+
+FIELDS = ("digest", "cveId", "packageName", "currentVersion", "fixedVersion")
+
+def keyset(path: str) -> set:
+    keys = set()
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            keys.add(tuple(row.get(k, "") for k in FIELDS))
+    return keys
+
+bash = keyset("scan_shell.csv")
+py   = keyset("scan.csv")
+print(f"bash:                  {len(bash)}")
+print(f"python:                {len(py)}")
+print(f"so no bash (tuplas):   {len(bash - py)}")
+print(f"so no python (tuplas): {len(py - bash)}")
+print(f"comum (tuplas):        {len(bash & py)}")
+PY
