@@ -22,6 +22,46 @@ Target runtime is Linux / WSL (bash 4+). macOS works for local dev if you instal
 
 **File layout requirement:** `enrich_cvedetails.py` MUST be co-located with `defender.sh` (same directory). `defender.sh` invokes it via `$(dirname "$0")/enrich_cvedetails.py`. If missing, `defender.sh` aborts with a clear error in Phase 2d.
 
+## Do zero ao primeiro run (Python pipeline)
+
+Passo a passo pra rodar o pipeline Python novo (`defender_pipeline`) numa máquina limpa. Se algum passo falhar, o `client-probe.sh` no fim mostra qual estágio quebrou e o motivo.
+
+```bash
+# 1. Clone
+git clone <URL_DO_REPO> defender && cd defender
+
+# 2. Virtualenv Python (isola dependências)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. Instala o pipeline Python (aspas obrigatórias — bash expande [ ])
+pip install -e '.[pipeline]'
+
+# 4. Login nos serviços do cliente
+az login          # Azure — pra scan (ARG + ACR)
+oc login <URL>    # OpenShift — pra cluster
+
+# 5. Roda o probe end-to-end (scan → cluster → expand)
+bash client-probe.sh
+```
+
+Output esperado (4 linhas):
+
+```
+SCAN     rows=NNN  cols=19  rc=0   ok
+CLUSTER  rows=NNN  cols=24  rc=0   ok
+EXPAND   rows=NNN  cols=22  rc=0   ok
+RESULT   3/3 stages ok
+```
+
+Se algum estágio der `fail`, aparece uma linha extra com o final do stderr. Colar no chat / issue pra diagnóstico.
+
+**Overrides via env** (não precisa mexer no script):
+
+```bash
+ACR=meuacr REPO=meurepo MINSCORE=9 bash client-probe.sh
+```
+
 ## Quickstart — full pipeline
 
 ```bash
