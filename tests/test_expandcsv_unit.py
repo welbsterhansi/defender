@@ -25,8 +25,8 @@ from tests._data import write_csv as _write_csv
 
 class TestGetField:
     def test_returns_first_non_empty(self) -> None:
-        row = {"NAMESPACE": "", "namespace": "prd-fad"}
-        assert expandcsv.get_field(row, "NAMESPACE", "namespace") == "prd-fad"
+        row = {"NAMESPACE": "", "namespace": "ns-app"}
+        assert expandcsv.get_field(row, "NAMESPACE", "namespace") == "ns-app"
 
     def test_prefers_first_name(self) -> None:
         row = {"NAMESPACE": "up", "namespace": "low"}
@@ -170,7 +170,7 @@ class TestExpandCves:
         rows = expandcsv.expand_cves(str(cruzamento_csv_legacy), *idxs)
         assert len(rows) == 1
         assert rows[0]["CVE_ID"] == "CVE-2024-0001"
-        assert rows[0]["NAMESPACE"] == "prd-fad"
+        assert rows[0]["NAMESPACE"] == "ns-app"
 
     def test_dedup_same_cve_in_same_workload(
         self, defender_csv_normal: Path, tmp_path: Path

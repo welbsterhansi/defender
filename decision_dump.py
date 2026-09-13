@@ -15,7 +15,7 @@ Fetches assessments + cvedetails ONCE, feeds both mergers, compares.
 Usage:
     python3 decision_dump.py [ACR] [REPO] [MIN_SCORE] [MAX_SCORE]
 
-Defaults: bdsoregistry / redhat-sso-7/rhsso75 / 7 / 10
+Defaults: contosoregistry / contoso/webapp / 7 / 10 (placeholders — passar reais)
 """
 from __future__ import annotations
 
@@ -130,8 +130,8 @@ def run_python_merger(
 
 
 def main() -> int:
-    _acr  = sys.argv[1] if len(sys.argv) > 1 else "bdsoregistry"
-    repo  = sys.argv[2] if len(sys.argv) > 2 else "redhat-sso-7/rhsso75"
+    _acr  = sys.argv[1] if len(sys.argv) > 1 else "contosoregistry"
+    repo  = sys.argv[2] if len(sys.argv) > 2 else "contoso/webapp"
     min_s = float(sys.argv[3] if len(sys.argv) > 3 else 7.0)
     max_s = float(sys.argv[4] if len(sys.argv) > 4 else 10.0)
 

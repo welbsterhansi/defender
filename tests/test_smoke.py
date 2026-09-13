@@ -23,7 +23,7 @@ def test_fixtures_defender_multiarch(defender_csv_multiarch: Path) -> None:
 def test_fixtures_cruzamento_new(cruzamento_csv_new: Path) -> None:
     with cruzamento_csv_new.open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    assert rows[0]["NAMESPACE"] == "prd-fad"
+    assert rows[0]["NAMESPACE"] == "ns-app"
     assert "CVE-2024-0001" in rows[0]["CVE_LIST"]
 
 

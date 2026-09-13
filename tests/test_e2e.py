@@ -174,13 +174,15 @@ def test_e2e_full_pipeline(
     assert 'data-search="' in html, "card data-search missing"
 
     # ---- Task #19: no hard-coded namespaces/CVEs in Analysis block --------
-    # Assert on strings that CANNOT come from the fixture — only from the
+    # Assert on strings that CANNOT come from the fixture — only from a
     # previously hard-coded copy in the analysis block. The fixture uses
-    # `prd-fad` and `prd-shared` as legitimate namespace names, so we can't
-    # ban those; but these composites/names never appear in fixture data:
+    # `ns-app` and `ns-shared` as neutral namespace placeholders, so we
+    # can't ban those; but these composites/names never appear in fixture
+    # data (they are fictional placeholders for prior client-specific
+    # leaks that must never re-enter the HTML):
     for stale in (
-        "prd-fad/financebatch", "prd-fad/realtime", "rhsso-prd/rhsso-prd",
-        "prd-airflow", "prd-env0", "prd-simul-internal",
+        "ns-legacy/service-a", "ns-legacy/service-b", "ns-old/deprecated",
+        "ns-archive/frozen", "ns-experimental/test", "ns-sandbox/tmp",
         "CVE-2024-52533", "CVE-2022-23990", "CVE-2025-6965",
     ):
         assert stale not in html, f"hard-coded {stale!r} leaked into HTML output"
@@ -291,7 +293,7 @@ def test_exploit_flags_survive_full_pipeline(
 
     Fixture: `defender_csv_normal` has CVE-2024-0002 flagged as
     hasVerifiedExploit=true on `myapp/backend@sha256:aaa111`, which is used by
-    `prd-fad/Deployment/backend` in `cruzamento_csv_new`.
+    `ns-app/Deployment/backend` in `cruzamento_csv_new`.
 
     Contract: that flag must survive every stage — the defender index, the
     expand step, the on-disk expanded.csv, and the final rendered HTML (as a

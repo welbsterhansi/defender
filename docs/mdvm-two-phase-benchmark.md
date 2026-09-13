@@ -2,7 +2,7 @@
 
 ## Motivation (baseline empírico 2026-09-11)
 
-Full-ACR scan (`bdsoregistry`, 9389 unique digests) run with `--skip-tags`:
+Full-ACR scan (ACR de referência ~9389 unique digests) run with `--skip-tags`:
 
 - **Phase 2 (per-digest with JOIN)**: 145 digests em ~15 min = ~9.7 digests/min
 - **Projected total**: ~16h para os 9389 digests
@@ -81,14 +81,14 @@ Quoting exato: `csv_field()` do bash (envolve em `"..."`, aspas internas viram `
 
 ### Ambiente de teste
 
-- ACR do cliente (`bdsoregistry`) — 9389 unique digests, 603 unique repos.
+- ACR de referência (~9389 unique digests, ~603 unique repos).
 - Identidade CLI com Security Reader no tenant.
 - Rodar de máquina Linux/WSL (target runtime — não macOS local).
 
 ### Runs pareados (mesmo escopo, path legado vs batched)
 
 **Baseline (per-digest legado):**
-- Roda: `./defender.sh --acr-name bdsoregistry --repository <repo-medio> --min-score 0 --max-score 10 --skip-tags`.
+- Roda: `./defender.sh --acr-name contosoregistry --repository <repo-medio> --min-score 0 --max-score 10 --skip-tags`.
 - Métricas: `total_arg_requests`, `total_time`, `rows_emitted`.
 - Escopo sugerido: 1 repo com ~20-50 digests (rodar em 5-10 min).
 
@@ -98,7 +98,7 @@ Quoting exato: `csv_field()` do bash (envolve em `"..."`, aspas internas viram `
 
 ### Escalada
 
-1. 1 repo pequeno (`--repository redhat-sso-7/rhsso75`, ~15 digests) → sanity check.
+1. 1 repo pequeno (`--repository contoso/webapp`, ~15 digests) → sanity check.
 2. 1 repo grande (>500 digests) → validar batching + skip-token.
 3. 3 repos misturados → concorrência interna do ARG.
 4. 10 repos → estress mais representativo.

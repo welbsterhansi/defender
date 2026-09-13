@@ -81,14 +81,14 @@ def defender_csv_missing_columns(tmp_path: Path) -> Path:
 def cruzamento_csv_new(tmp_path: Path) -> Path:
     """Grouped output — 1 workload with 2 CVEs on backend, 1 CVE on shared/base."""
     rows = [
-        ["prd-fad", "Deployment", "backend", "myapp/backend", "sha256:aaa111", "v1.2",
+        ["ns-app", "Deployment", "backend", "myapp/backend", "sha256:aaa111", "v1.2",
          "2", "Critical", "10.0",
          "CVE-2024-0001, CVE-2024-0002",
          "CVE-2024-0001:Critical;CVE-2024-0002:Critical",
          "os", "python", "django", "4.1.0", "4.2.11", "true",
          "Upgrade", "FixAvailable", "45", "false", "true", "false",
          "2025-01-15T10:00:00Z"],
-        ["prd-shared", "StatefulSet", "database", "shared/base", "sha256:bbb222", "latest",
+        ["ns-shared", "StatefulSet", "database", "shared/base", "sha256:bbb222", "latest",
          "1", "Critical", "9.1",
          "CVE-2024-0003",
          "CVE-2024-0003:Critical",
@@ -104,7 +104,7 @@ def cruzamento_csv_legacy(tmp_path: Path) -> Path:
     """Legacy lowercase header — expandcsv.py must still parse it."""
     legacy_header = [c.lower() for c in CRUZAMENTO_HEADER]
     rows = [
-        ["prd-fad", "Deployment", "backend", "myapp/backend", "sha256:aaa111", "v1.2",
+        ["ns-app", "Deployment", "backend", "myapp/backend", "sha256:aaa111", "v1.2",
          "1", "Critical", "9.8",
          "CVE-2024-0001",
          "CVE-2024-0001:Critical",

@@ -15,15 +15,15 @@
 # (traz azure-identity, azure-mgmt-resourcegraph, azure-containerregistry,
 # kubernetes, tenacity — sem esses o scan falha com ImportError).
 #
-# Overrides via env:
-#     ACR=<name>           default bdsoregistry
-#     REPO=<substring>     default redhat-sso-7/rhsso75  (scope pequeno)
+# Overrides via env (SEMPRE passar os reais — os defaults sao placeholders):
+#     ACR=<name>           default contosoregistry
+#     REPO=<substring>     default contoso/webapp  (scope pequeno)
 #     MINSCORE=<float>     default 7
 
 set +e
 
-ACR="${ACR:-bdsoregistry}"
-REPO="${REPO:-redhat-sso-7/rhsso75}"
+ACR="${ACR:-contosoregistry}"
+REPO="${REPO:-contoso/webapp}"
 MINSCORE="${MINSCORE:-7}"
 
 WORK=$(mktemp -d) || { echo "erro: mktemp"; exit 1; }
