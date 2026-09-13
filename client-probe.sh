@@ -7,10 +7,13 @@
 #
 # Uso:
 #     git pull origin main
-#     source .venv/bin/activate     # ou pip install -e .
+#     python3 -m venv .venv && source .venv/bin/activate
+#     pip install -e '.[pipeline]'   # aspas obrigatorias — bash expande []
 #     bash client-probe.sh
 #
-# Pre-req: az login (scan) + oc login (cluster).
+# Pre-req: az login (scan) + oc login (cluster) + extra [pipeline] instalado
+# (traz azure-identity, azure-mgmt-resourcegraph, azure-containerregistry,
+# kubernetes, tenacity — sem esses o scan falha com ImportError).
 #
 # Overrides via env:
 #     ACR=<name>           default bdsoregistry
