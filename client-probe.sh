@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# client-probe.sh — teste de paridade bash vs python (roda no cliente).
+# client-probe.sh — valida a pipeline Python end-to-end no cliente.
 #
-# Cobre os 3 estagios da pipeline (scan, cluster, expand) e imprime 4
-# linhas sinteticas: 3 comparacoes + 1 veredicto final.
+# Roda APENAS `python -m defender_pipeline` (scan → cluster → expand).
+# Nao invoca defender.sh/check_ocp.sh — a comparacao bash x python fica
+# nos testes locais (tests/test_defender_pipeline_*.py).
 #
 # Uso:
 #     git pull origin main
+#     source .venv/bin/activate     # ou pip install -e .
 #     bash client-probe.sh
 #
-# Pre-req: az login (para scan) + oc login (para cluster) + venv com
-# defender_pipeline instalado (pip install -e .).
+# Pre-req: az login (scan) + oc login (cluster).
 #
 # Overrides via env:
 #     ACR=<name>           default bdsoregistry
@@ -25,56 +26,57 @@ MINSCORE="${MINSCORE:-7}"
 WORK=$(mktemp -d) || { echo "erro: mktemp"; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
-# ── 1. SCAN — bash x python ──────────────────────────────────────────────
-./defender.sh --acr-name "$ACR" --repository "$REPO" \
-              --min-score "$MINSCORE" --skip-tags >/dev/null 2>&1
-mv -f vulnerable_images_report.csv "$WORK/scan_bash.csv" 2>/dev/null
+SCAN_CSV="$WORK/scan.csv"
+CLUSTER_CSV="$WORK/cluster.csv"
+EXPAND_CSV="$WORK/expand.csv"
 
+# Contratos congelados
+COLS_SCAN=19
+COLS_CLUSTER=24
+COLS_EXPAND=22
+
+check_stage() {
+    local label="$1" csv="$2" rc="$3" cols_expected="$4" log="$5"
+    local rows="-" cols="-" status="fail"
+    if [[ -f "$csv" ]]; then
+        rows=$(( $(wc -l < "$csv" | tr -d ' ') - 1 ))
+        cols=$(head -n1 "$csv" | awk -F',' '{print NF}')
+        if [[ "$rc" -eq 0 && "$cols" -eq "$cols_expected" && "$rows" -ge 0 ]]; then
+            status="ok"
+        fi
+    fi
+    printf "%-8s rows=%-6s cols=%-3s rc=%-3s %s\n" \
+        "$label" "$rows" "$cols" "$rc" "$status"
+    if [[ "$status" != "ok" && -s "$log" ]]; then
+        echo "         ↳ $(tail -n1 "$log" | cut -c1-120)"
+    fi
+    [[ "$status" == "ok" ]]
+}
+
+# ── 1. SCAN ──────────────────────────────────────────────────────────────
 python3 -m defender_pipeline scan --acr-name "$ACR" --repository "$REPO" \
     --min-score "$MINSCORE" --skip-tags \
-    --output "$WORK/scan_py.csv" >/dev/null 2>&1
+    --output "$SCAN_CSV" >/dev/null 2>"$WORK/scan.err"
+SCAN_RC=$?
 
-SCAN_BASH=$(wc -l < "$WORK/scan_bash.csv" 2>/dev/null | tr -d ' ')
-SCAN_PY=$(wc -l < "$WORK/scan_py.csv" 2>/dev/null | tr -d ' ')
-SCAN_EQ="false"; cmp -s "$WORK/scan_bash.csv" "$WORK/scan_py.csv" && SCAN_EQ="true"
-
-# ── 2. CLUSTER — bash x python (mesmo input: scan_bash.csv) ──────────────
-cp "$WORK/scan_bash.csv" vulnerable_images_report.csv
-./check_ocp.sh >/dev/null 2>&1
-mv -f resultado_cruzamento.csv "$WORK/cluster_bash.csv" 2>/dev/null
-
+# ── 2. CLUSTER ───────────────────────────────────────────────────────────
 python3 -m defender_pipeline cluster \
-    --vulnerabilities "$WORK/scan_bash.csv" \
-    --output "$WORK/cluster_py.csv" >/dev/null 2>&1
+    --vulnerabilities "$SCAN_CSV" \
+    --output "$CLUSTER_CSV" >/dev/null 2>"$WORK/cluster.err"
+CL_RC=$?
 
-CL_BASH=$(wc -l < "$WORK/cluster_bash.csv" 2>/dev/null | tr -d ' ')
-CL_PY=$(wc -l < "$WORK/cluster_py.csv" 2>/dev/null | tr -d ' ')
-CL_EQ="false"; cmp -s "$WORK/cluster_bash.csv" "$WORK/cluster_py.csv" && CL_EQ="true"
-
-# ── 3. EXPAND — bash x python (mesmos inputs) ────────────────────────────
-python3 expandcsv.py \
-    --cruzamento "$WORK/cluster_bash.csv" \
-    --vulnerabilities "$WORK/scan_bash.csv" \
-    --output "$WORK/expand_bash.csv" >/dev/null 2>&1
-
+# ── 3. EXPAND ────────────────────────────────────────────────────────────
 python3 -m defender_pipeline expand \
-    --cruzamento "$WORK/cluster_bash.csv" \
-    --vulnerabilities "$WORK/scan_bash.csv" \
-    --output "$WORK/expand_py.csv" >/dev/null 2>&1
-
-EX_BASH=$(wc -l < "$WORK/expand_bash.csv" 2>/dev/null | tr -d ' ')
-EX_PY=$(wc -l < "$WORK/expand_py.csv" 2>/dev/null | tr -d ' ')
-EX_EQ="false"; cmp -s "$WORK/expand_bash.csv" "$WORK/expand_py.csv" && EX_EQ="true"
+    --cruzamento "$CLUSTER_CSV" \
+    --vulnerabilities "$SCAN_CSV" \
+    --output "$EXPAND_CSV" >/dev/null 2>"$WORK/expand.err"
+EX_RC=$?
 
 # ── 4. Veredicto ─────────────────────────────────────────────────────────
-MATCH=0
-[[ "$SCAN_EQ" == "true" ]] && MATCH=$((MATCH+1))
-[[ "$CL_EQ"   == "true" ]] && MATCH=$((MATCH+1))
-[[ "$EX_EQ"   == "true" ]] && MATCH=$((MATCH+1))
+OK=0
+check_stage "SCAN"    "$SCAN_CSV"    "$SCAN_RC" "$COLS_SCAN"    "$WORK/scan.err"    && OK=$((OK+1))
+check_stage "CLUSTER" "$CLUSTER_CSV" "$CL_RC"   "$COLS_CLUSTER" "$WORK/cluster.err" && OK=$((OK+1))
+check_stage "EXPAND"  "$EXPAND_CSV"  "$EX_RC"   "$COLS_EXPAND"  "$WORK/expand.err"  && OK=$((OK+1))
+printf "RESULT   %d/3 stages ok\n" "$OK"
 
-printf "SCAN     bash=%-6s py=%-6s equal=%s\n"    "$SCAN_BASH" "$SCAN_PY" "$SCAN_EQ"
-printf "CLUSTER  bash=%-6s py=%-6s equal=%s\n"    "$CL_BASH"   "$CL_PY"   "$CL_EQ"
-printf "EXPAND   bash=%-6s py=%-6s equal=%s\n"    "$EX_BASH"   "$EX_PY"   "$EX_EQ"
-printf "RESULT   %d/3 stages match\n"             "$MATCH"
-
-[[ "$MATCH" -eq 3 ]]
+[[ "$OK" -eq 3 ]]
