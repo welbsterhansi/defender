@@ -144,8 +144,31 @@ def cmd_cluster(args: argparse.Namespace) -> int:
 
 
 def cmd_expand(args: argparse.Namespace) -> int:
-    """Grouped CSV → per-CVE row explosion. Implemented in P0.7."""
-    _not_yet_implemented("expand", "P0.7")
+    """Grouped CSV → per-CVE row explosion (P0.7a).
+
+    Same output as ``expandcsv.py``: 22-column CSV at ``args.output``.
+    """
+    from pathlib import Path
+
+    from defender_pipeline.logging_setup import setup
+    from defender_pipeline.reports.expand import ExpandOptions, run_expand
+
+    setup(log_format=args.log_format, level=args.log_level)
+
+    opts = ExpandOptions(
+        cruzamento=Path(args.cruzamento),
+        vulnerabilities=Path(args.vulnerabilities),
+        output=Path(args.output),
+    )
+
+    try:
+        rows = run_expand(opts)
+    except Exception as exc:
+        print(f"expand failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print(f"expand complete: {rows} rows written to {args.output}", file=sys.stderr)
+    return EXIT_OK
 
 
 def cmd_report(args: argparse.Namespace) -> int:

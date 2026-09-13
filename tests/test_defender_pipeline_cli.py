@@ -115,13 +115,8 @@ class TestCliHelp:
 
 class TestSubcommandsStillStubbed:
     """Subcommands not yet implemented exit 2 with a task pointer.
-    scan (P0.5), diff (P0.5), cluster (P0.6) have already been
-    implemented — their behavior is covered in the sibling test files."""
-
-    def test_expand_stub_exits_2(self) -> None:
-        r = _run_module("expand")
-        assert r.returncode == 2
-        assert "P0.7" in r.stderr
+    scan (P0.5), diff (P0.5), cluster (P0.6), expand (P0.7a) already
+    implemented — their behavior lives in the sibling test files."""
 
     def test_report_stub_exits_2(self) -> None:
         r = _run_module("report")

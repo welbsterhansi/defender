@@ -218,4 +218,10 @@ the local CLI toolchain.
 - **Order of work is enforced by task blocking**: P0.1 (docs) → P0.2
   (contract freeze + contract tests) → P0.3 (architecture design)
   → P0.4 (skeleton) → P0.5 (scan API-first) → P0.6 (OpenShift API-first)
-  → P0.7 (expand + report CLI) → P0.8 (cleanup plan). Do not skip ahead.
+  → P0.7a (expand API-first) → P0.7b (report) → P0.7c (`all` orchestrator)
+  → P0.8 (cleanup plan). Do not skip ahead.
+- **`expand` (P0.7a) status:** shipped in `defender_pipeline.reports.expand`.
+  Byte-identical to `expandcsv.py` on shared inputs — guarded by
+  `tests/test_defender_pipeline_expand.py::TestByteEquivalenceWithLegacy`.
+  Use `python -m defender_pipeline expand` in new automation; `expandcsv.py`
+  stays as fallback until P0.8.
